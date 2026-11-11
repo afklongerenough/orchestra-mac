@@ -556,7 +556,8 @@ final class CompanionManager: ObservableObject {
             // Live mode: one tap starts a two-way conversation, the next ends it.
             if isLiveModeEnabled {
                 // During a live takeover, a tap stops the takeover but keeps the conversation.
-                if isScreenTakeoverRunning && isLiveSessionActive {
+                // (A second tap, once a stop was asked for, ends the conversation as usual.)
+                if isScreenTakeoverRunning && isLiveSessionActive && stoppedTakeoverStartNumber != takeoverStartNumber {
                     stopRunningScreenTakeover()
                     return
                 }
@@ -1136,16 +1137,18 @@ final class CompanionManager: ObservableObject {
 
     /// The running "drive my screen" session, if any. Holding the hotkey cancels it.
     private var currentScreenTakeoverTask: Task<Void, Never>?
-    /// Which takeover is current, so an older one finishing doesn't clear the flag.
-    private var screenTakeoverGeneration = 0
+    /// Counts takeover starts, so an older one finishing doesn't clear the flag.
+    private var takeoverStartNumber = 0
+    /// Set when the user stopped that takeover on purpose (tap or "stop").
+    private var stoppedTakeoverStartNumber = -1
+    /// True until the takeover task has really returned, so nothing else
+    /// clicks or types while an in-flight action is still finishing.
     private var isScreenTakeoverRunning = false
 
-    /// Stops the takeover right away (the flag clears now, not when the model call unwinds).
+    /// Stops the takeover: no new actions start; the flag clears when the task returns.
     private func stopRunningScreenTakeover() {
+        stoppedTakeoverStartNumber = takeoverStartNumber
         currentScreenTakeoverTask?.cancel()
-        currentScreenTakeoverTask = nil
-        screenTakeoverGeneration += 1
-        isScreenTakeoverRunning = false
     }
 
     private func startScreenTakeover(goal: String) {
@@ -1154,13 +1157,13 @@ final class CompanionManager: ObservableObject {
             Task { try? await speechOutputClient.speakText("screen sharing is set to never, so i can't take over your screen. you can change that in the orchestra menu.") }
             return
         }
-        screenTakeoverGeneration += 1
-        let thisTakeoverGeneration = screenTakeoverGeneration
+        takeoverStartNumber += 1
+        let thisTakeoverStartNumber = takeoverStartNumber
         isScreenTakeoverRunning = true
         currentScreenTakeoverTask = Task { [weak self] in
             guard let self else { return }
             defer {
-                if self.screenTakeoverGeneration == thisTakeoverGeneration {
+                if self.takeoverStartNumber == thisTakeoverStartNumber {
                     self.isScreenTakeoverRunning = false
                 }
             }
@@ -1185,12 +1188,13 @@ final class CompanionManager: ObservableObject {
             )
             let outcome = await takeoverSession.run()
             OrchestraLog.write("🖱️ Takeover ended (finished: \(outcome.finished)): \(outcome.spokenSummary)")
+            let wasStoppedByUser = self.stoppedTakeoverStartNumber == thisTakeoverStartNumber
             self.conversationHistory.append((
-                userTranscript: "(screen takeover finished) goal: \(goal)",
+                userTranscript: "(screen takeover \(wasStoppedByUser ? "stopped by the user" : "ended")) goal: \(goal)",
                 assistantResponse: outcome.spokenSummary
             ))
-            // Stopped on purpose (tap or "stop"): the user already knows.
-            guard self.screenTakeoverGeneration == thisTakeoverGeneration else { return }
+            // Stopped in Live mode on purpose: the live voice already answered "stopped".
+            if wasStoppedByUser && self.isLiveSessionActive { return }
             if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
                 // Live mode: let the live voice say how it went.
                 await liveSession.sendTextTurn("(note from the screen agent, not the user) the screen takeover \(outcome.finished ? "finished" : "stopped"): \(outcome.spokenSummary) — tell the user in one short sentence; if it asked a question, ask them that question.")

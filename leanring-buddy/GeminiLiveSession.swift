@@ -391,8 +391,9 @@ final class GeminiLiveSession: NSObject {
             let userSpokeRecently = Date().timeIntervalSince(lastUserSpeechDate) < 1.5
             if !isModelSpeaking && !userSpokeRecently { break }
             try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
         }
-        guard liveState == .live else { return }
+        guard liveState == .live, !Task.isCancelled else { return }
         let userTurn: [String: Any] = ["role": "user", "parts": [["text": noteText]]]
         sendJSON(["clientContent": ["turns": [userTurn], "turnComplete": true]])
     }
