@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 40
     env:
       # Forks don't have the signing secret; they fall back to ad-hoc signing.
-      HAS_SIGNING_CERTIFICATE: ${{ secrets.ORCHESTRA_SIGNING_P12 != '' }}
+      HAS_SIGNING_CERTIFICATE: ${{ secrets.ORCHESTRA_SIGNING_P12 != '' && secrets.ORCHESTRA_SIGNING_P12_PASSWORD != '' }}
       SIGNING_IDENTITY_NAME: Orchestra Self-Signed Code Signing
     steps:
       - uses: actions/checkout@v4
@@ -81,11 +81,11 @@ jobs:
           security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN_PATH" -P "$SIGNING_P12_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/signing.p12"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "$HOME/Library/Keychains/login.keychain-db"
           # A self-signed certificate has to be trusted for code signing on this runner.
           security find-certificate -c "$SIGNING_IDENTITY_NAME" -p "$KEYCHAIN_PATH" > "$RUNNER_TEMP/signing-cert.pem"
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/signing-cert.pem" \
-            || echo "::warning::could not mark the signing certificate as trusted"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/signing-cert.pem"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Re-sign whole bundle

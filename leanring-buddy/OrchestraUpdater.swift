@@ -15,6 +15,7 @@
 //
 
 import AppKit
+import Combine
 import Foundation
 import Security
 
@@ -50,8 +51,11 @@ final class OrchestraUpdater: ObservableObject {
         periodicCheckTimer = Timer.scheduledTimer(withTimeInterval: Self.periodicCheckIntervalSeconds, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                // Don't interrupt an install or replace a visible result.
-                if case .installing = self.updateState { return }
+                // Don't interrupt an install or hide an update that's already waiting.
+                switch self.updateState {
+                case .installing, .available, .checking: return
+                default: break
+                }
                 await self.checkForUpdates()
             }
         }
@@ -60,6 +64,10 @@ final class OrchestraUpdater: ObservableObject {
     // MARK: - Check
 
     func checkForUpdates() async {
+        guard currentBuildNumber > 0 else {
+            updateState = .failed("can't tell this copy's build number; update by hand once")
+            return
+        }
         updateState = .checking
         var request = URLRequest(url: Self.latestReleaseAPIURL)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -136,6 +144,8 @@ final class OrchestraUpdater: ObservableObject {
         let mountedAppURL = mountPointURL.appendingPathComponent("Orchestra.app", isDirectory: true)
         let stagedAppURL = workingFolderURL.appendingPathComponent("Orchestra.app", isDirectory: true)
         try await Self.runTool("/usr/bin/ditto", arguments: [mountedAppURL.path, stagedAppURL.path])
+        // A quarantine flag (if the download got one) would make Gatekeeper block the relaunch.
+        try? await Self.runTool("/usr/bin/xattr", arguments: ["-dr", "com.apple.quarantine", stagedAppURL.path])
         try Self.verifySignature(ofAppAt: stagedAppURL, satisfies: runningAppRequirement)
 
         let stagedBuildNumber = Int(Bundle(url: stagedAppURL)?.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 0
@@ -159,10 +169,15 @@ final class OrchestraUpdater: ObservableObject {
         OrchestraLog.write("⬆️ Updated to build \(stagedBuildNumber); relaunching")
 
         updateState = .installing(step: "restarting")
-        // Reopen after this process has quit.
+        // Reopen once this process has really exited (waits on our pid, up to ~30 s).
         let relaunchProcess = Process()
         relaunchProcess.executableURL = URL(fileURLWithPath: "/bin/sh")
-        relaunchProcess.arguments = ["-c", "sleep 1.5; /usr/bin/open \"$0\"", installedAppURL.path]
+        relaunchProcess.arguments = [
+            "-c",
+            "for attempt in $(seq 1 150); do /bin/kill -0 \"$1\" 2>/dev/null || break; sleep 0.2; done; /usr/bin/open -n \"$0\"",
+            installedAppURL.path,
+            String(ProcessInfo.processInfo.processIdentifier)
+        ]
         try relaunchProcess.run()
         NSApp.terminate(nil)
     }

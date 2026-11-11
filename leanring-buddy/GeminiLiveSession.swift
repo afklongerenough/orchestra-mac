@@ -37,6 +37,8 @@ final class GeminiLiveSession: NSObject {
         let runMacAction: (_ action: String) async -> String
         let startJob: (_ place: OrchestraJobPlace, _ brief: String) -> String
         let takeOverScreen: (_ goal: String) -> String
+        let showMeHow: (_ goal: String) -> String
+        let runBrowserAction: (_ action: String, _ elementIdentifier: Int?, _ text: String) -> String
         let stopTakeover: () -> String
         let addRoutine: (_ schedule: String, _ place: OrchestraJobPlace, _ brief: String) -> String
         let recentJobsSummary: () -> String
@@ -217,6 +219,24 @@ final class GeminiLiveSession: NSObject {
             "parameters": stringParameters(["goal"], required: ["goal"])
         ],
         [
+            "name": "show_me_how",
+            "description": "Teach the user to do a task themselves: a guide points the blue cursor at each step, you'll get a note with each step to say, and it waits for them to do it. Goal must stand on its own (what they want to learn, in which app).",
+            "parameters": stringParameters(["goal"], required: ["goal"])
+        ],
+        [
+            "name": "browser",
+            "description": "Work inside the web page in the front browser (Chrome, Brave, Edge, Arc, Safari). action: 'read' (title, address, buttons/links/fields with ids, page text) | 'click' (needs id) | 'type' (needs id and text; replaces the field's text) | 'open' (text = https address) | 'scroll' (text = screens, negative = up) | 'back'. Read first to get ids; ids change on every read. Never for send/buy/delete buttons.",
+            "parameters": [
+                "type": "object",
+                "properties": [
+                    "action": ["type": "string"] as [String: Any],
+                    "id": ["type": "integer"] as [String: Any],
+                    "text": ["type": "string"] as [String: Any]
+                ] as [String: Any],
+                "required": ["action"]
+            ] as [String: Any]
+        ],
+        [
             "name": "stop_screen_takeover",
             "description": "Stop a running take_over_screen right away (when the user says stop / wait / cancel).",
             "parameters": stringParameters([], required: [])
@@ -358,6 +378,20 @@ final class GeminiLiveSession: NSObject {
             return toolHandlers.takeOverScreen(arguments["goal"] as? String ?? "")
         case "stop_screen_takeover":
             return toolHandlers.stopTakeover()
+        case "show_me_how":
+            return toolHandlers.showMeHow(arguments["goal"] as? String ?? "")
+        case "browser":
+            // Reading a page shows its content to the model: same consent rule as looking at the screen.
+            let browserAction = (arguments["action"] as? String ?? "read").lowercased()
+            if browserAction == "read" && ScreenSharingMode.current == .onlyWhenAsked
+                && (Date().timeIntervalSince(lastUserSpeechDate) > 45 || !ScreenPrivacySettings.transcriptAsksToLook(recentUserSpeechText)) {
+                return "the user hasn't asked you to look, and their setting only allows looking when they ask. ask them if you may read the page."
+            }
+            let elementIdentifier = (arguments["id"] as? Int) ?? (arguments["id"] as? Double).map { Int($0) }
+                ?? (arguments["id"] as? String).flatMap { Int($0) }
+            return toolHandlers.runBrowserAction(arguments["action"] as? String ?? "read",
+                                                 elementIdentifier,
+                                                 arguments["text"] as? String ?? "")
         case "add_routine":
             let place: OrchestraJobPlace = (arguments["place"] as? String)?.lowercased() == "mac" ? .mac : .hermes
             return toolHandlers.addRoutine(arguments["schedule"] as? String ?? "", place, arguments["brief"] as? String ?? "")

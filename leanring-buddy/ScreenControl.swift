@@ -167,6 +167,9 @@ enum ScreenControl {
     // MARK: - Safety gate (enforced in code, not just in the prompt)
 
     /// Words on a button/link that mean "this step can't be undone".
+    /// The same "can't be undone" words, for the browser gate.
+    static var irreversibleWordsPatternForSharing: String { irreversibleWordsPattern }
+
     private static let irreversibleWordsPattern = #"\b(send|buy|purchase|pay|place order|checkout|check out|delete|remove|trash|erase|post|publish|submit|confirm|transfer|tweet|reply all|unsubscribe)\b"#
 
     /// If the thing under this point is an irreversible button (Send, Buy,

@@ -72,7 +72,7 @@ final class ScreenTakeoverSession {
             actions done so far:
             \(actionLog.isEmpty ? "(none yet)" : actionLog.joined(separator: "\n"))
             look at the screen now and give the next actions.
-            """
+            """ + Self.browserPageContextForPrompt()
 
             var commandTexts: [String] = []
             var previousReplyHadNoActions = false
@@ -129,6 +129,12 @@ final class ScreenTakeoverSession {
                     return Outcome(finished: true, spokenSummary: commandArgument.isEmpty ? "done." : commandArgument)
                 case "ask", "stop":
                     return Outcome(finished: false, spokenSummary: commandArgument.isEmpty ? "i need you for the next bit." : commandArgument)
+                case "web_click", "web_type", "web_open", "web_scroll", "web_back":
+                    actionLog.append("- \(commandText) → \(Self.runBrowserCommand(named: commandName, argument: commandArgument))")
+                    if commandName == "web_click" || commandName == "web_open" || commandName == "web_back" {
+                        // Give the page time to load before the next action.
+                        try? await Task.sleep(nanoseconds: 900_000_000)
+                    }
                 case "drag":
                     // "drag x1,y1 to x2,y2" (grid coordinates) — mainly for selecting text.
                     let dragEndpointTexts = commandArgument.components(separatedBy: " to ")
@@ -208,6 +214,43 @@ final class ScreenTakeoverSession {
         return Outcome(finished: false, spokenSummary: "that took more steps than i allow, so i stopped. want me to keep going?")
     }
 
+    // MARK: - Browser
+
+    /// When a browser is in front and browser control is on, the page's
+    /// elements (with ids) go into the prompt: clicking by id beats pixels.
+    private static func browserPageContextForPrompt() -> String {
+        guard let browserName = BrowserControl.frontmostBrowserName else { return "" }
+        do {
+            let pageSummary = try BrowserControl.readPage(maximumTextCharacters: 1500)
+            return "\n\nthe front app is \(browserName). its page, read directly (prefer web_click / web_type with these ids over pixel clicks inside the page):\n\(pageSummary)"
+        } catch {
+            return "\n\n(the front app is \(browserName), but reading the page failed: \(error.localizedDescription). use pixel clicks.)"
+        }
+    }
+
+    private static func runBrowserCommand(named commandName: String, argument commandArgument: String) -> String {
+        let argumentParts = commandArgument.split(separator: " ", maxSplits: 1).map(String.init)
+        let elementIdentifier = argumentParts.first.flatMap { Int($0.filter(\.isNumber)) }
+        do {
+            switch commandName {
+            case "web_click":
+                guard let elementIdentifier else { return "skipped: needs an element id" }
+                return try BrowserControl.clickElement(id: elementIdentifier)
+            case "web_type":
+                guard let elementIdentifier, argumentParts.count == 2 else { return "skipped: write it as web_type <id> <text>" }
+                return try BrowserControl.typeIntoElement(id: elementIdentifier, text: argumentParts[1])
+            case "web_open":
+                return try BrowserControl.openAddress(commandArgument)
+            case "web_scroll":
+                return try BrowserControl.scrollPage(screens: Double(commandArgument.trimmingCharacters(in: .whitespaces)) ?? 1)
+            default:
+                return try BrowserControl.goBack()
+            }
+        } catch {
+            return "failed: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Parsing
 
     /// Commands come as [DO: click 120,340] tags, in order.
@@ -263,6 +306,12 @@ final class ScreenTakeoverSession {
     [DO: wait 2]               wait seconds for something to load
     [DO: open_app Notes]       open an app by name
     [DO: open_url https://...] open a link
+    when a browser page list is given below the step:
+    [DO: web_click 12]         click page element 12 (ids from the list; read fresh every step)
+    [DO: web_type 7 some text] put text into page field 7 (replaces what's there)
+    [DO: web_open https://...] go to an address in the front tab
+    [DO: web_scroll 1]         scroll the page one screen (negative = up)
+    [DO: web_back]             go back
     [DO: done short spoken summary of what you did]
     [DO: ask the one question you need the user to answer]
 

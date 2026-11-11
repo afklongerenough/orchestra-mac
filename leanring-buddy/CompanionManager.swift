@@ -708,7 +708,12 @@ final class CompanionManager: ObservableObject {
     driving the screen (takeover):
     when the user says "do it for me", "fill this in", "set this up", or asks for something that needs several clicks and typing inside an app on their screen, say one short line ("okay, taking over, hold the hotkey to stop me") and add:
     [TAKEOVER: the goal in one clear sentence, with any details the user gave]
-    a separate step-by-step loop will then look at the screen and click and type for them. it stops before anything irreversible (send, buy, delete) and asks them.
+    a separate step-by-step loop will then look at the screen and click and type for them. it stops before anything irreversible (send, buy, delete) and asks them. when a browser is in front it can also click and type inside the web page directly.
+
+    teaching (show me how):
+    when the user wants to learn to do it themselves ("show me how", "teach me", "walk me through", "how do i …" for something that takes more than one step), say one short line ("sure, follow the blue cursor") and add:
+    [SHOWME: what they want to learn, in one clear sentence]
+    a guide will then point at each step and say it, and wait for them to do it before the next one. for a single step, just answer and point.
 
     thinking harder (escalation):
     if the question needs careful reasoning — tricky math, debugging code on screen, a long technical explanation, a hard decision — reply with only [SMARTER] and nothing else. a stronger model will answer instead. don't use it for normal chat.
@@ -825,6 +830,10 @@ final class CompanionManager: ObservableObject {
                 // [TAKEOVER: goal] = the user asked us to do something by driving their screen.
                 let takeoverParseResult = Self.extractTagContent(named: "TAKEOVER", from: fullResponseText)
                 fullResponseText = takeoverParseResult.remainingText
+
+                // [SHOWME: goal] = the user wants to learn it: guide them step by step.
+                let showMeParseResult = Self.extractTagContent(named: "SHOWME", from: fullResponseText)
+                fullResponseText = showMeParseResult.remainingText
 
                 // [ASK_HERMES: question] = quick read of the user's accounts; the answer is spoken when it arrives.
                 let askHermesParseResult = Self.extractTagContent(named: "ASK_HERMES", from: fullResponseText)
@@ -991,6 +1000,8 @@ final class CompanionManager: ObservableObject {
 
                 if let takeoverGoal = takeoverParseResult.tagContent {
                     startScreenTakeover(goal: takeoverGoal)
+                } else if let walkthroughGoal = showMeParseResult.tagContent {
+                    startScreenWalkthrough(goal: walkthroughGoal)
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
@@ -1074,6 +1085,45 @@ final class CompanionManager: ObservableObject {
                 self.startScreenTakeover(goal: goal)
                 return "started. it's working on the screen now; say one short line like 'on it' and don't use mac_action or point_at until it reports back. if the user says stop, call stop_screen_takeover."
             },
+            showMeHow: { [weak self] goal in
+                guard let self else { return "not available" }
+                if ScreenSharingMode.current == .never {
+                    return "screen sharing is set to never, so you can't guide on screen. tell the user they can change it in the orchestra menu."
+                }
+                self.startScreenWalkthrough(goal: goal)
+                return "started. say one short line like 'sure, follow the blue cursor'. you'll get a note for each step: say it briefly, then let them do it. if they say stop, call stop_screen_takeover."
+            },
+            runBrowserAction: { [weak self] action, elementIdentifier, text in
+                guard let self else { return "not available" }
+                if self.isScreenTakeoverRunning {
+                    return "not done: the screen agent is still working. wait for it to report back, or call stop_screen_takeover first."
+                }
+                if ScreenSharingMode.current == .never && action.lowercased() == "read" {
+                    return "screen sharing is set to never, so you can't read the page."
+                }
+                do {
+                    switch action.lowercased() {
+                    case "read":
+                        return try BrowserControl.readPage()
+                    case "click":
+                        guard let elementIdentifier else { return "click needs an id from read" }
+                        return try BrowserControl.clickElement(id: elementIdentifier)
+                    case "type":
+                        guard let elementIdentifier else { return "type needs an id from read" }
+                        return try BrowserControl.typeIntoElement(id: elementIdentifier, text: text)
+                    case "open":
+                        return try BrowserControl.openAddress(text)
+                    case "scroll":
+                        return try BrowserControl.scrollPage(screens: Double(text) ?? 1)
+                    case "back":
+                        return try BrowserControl.goBack()
+                    default:
+                        return "unknown browser action \(action)"
+                    }
+                } catch {
+                    return "failed: \(error.localizedDescription)"
+                }
+            },
             stopTakeover: { [weak self] in
                 guard let self, self.isScreenTakeoverRunning else { return "nothing was running" }
                 self.stopRunningScreenTakeover()
@@ -1126,7 +1176,9 @@ final class CompanionManager: ObservableObject {
     - point_at: fly the blue cursor to something on screen when showing them where to click helps. x,y are on a 0-1000 grid over the latest frame (0,0 top-left, 1000,1000 bottom-right).
     - mac_action: one quick thing right now (spotify, open apps and links, volume, scrolling, 'type <text>' into the field that has focus, 'key cmd+c' to copy what's already selected, 'key cmd+v' to paste).
     - take_over_screen: anything that needs clicking or selecting on screen (e.g. "copy this paragraph", "write this into that box", "fill this in"). it runs in the background while you stay in the conversation. write a goal that stands on its own: what to do, and the exact visible text or element you mean (resolve "this"/"that" from the screen and the conversation).
-    - stop_screen_takeover: when the user says stop or wait during a takeover.
+    - show_me_how: when the user wants to learn to do it themselves ("show me how", "teach me", "walk me through"). a guide points at each step and you'll be asked to say each step; they do the clicking.
+    - stop_screen_takeover: when the user says stop or wait during a takeover or a walkthrough.
+    - browser: when a web browser is in front — read the page (titles, buttons, fields and text, with ids), click or type by id, open an address, scroll, go back. more accurate than pointing for web pages; use read first to get ids.
     - start_job: real work in the background. place "hermes" for research, the web, and their accounts (email, calendar, files, notes, reminders, github). place "mac" for their mac's files and apps. the brief must stand on its own.
     - add_routine: when the user wants something on a schedule.
     - recent_jobs: when the user asks how a job went.
@@ -1153,6 +1205,15 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startScreenTakeover(goal: String) {
+        startScreenTask(goal: goal, isWalkthrough: false)
+    }
+
+    /// "Show me how": point + say each step while the user does it themselves.
+    private func startScreenWalkthrough(goal: String) {
+        startScreenTask(goal: goal, isWalkthrough: true)
+    }
+
+    private func startScreenTask(goal: String, isWalkthrough: Bool) {
         currentScreenTakeoverTask?.cancel()
         if ScreenSharingMode.current == .never {
             Task { try? await speechOutputClient.speakText("screen sharing is set to never, so i can't take over your screen. you can change that in the orchestra menu.") }
@@ -1174,31 +1235,55 @@ final class CompanionManager: ObservableObject {
                 if Task.isCancelled { return }
             }
             let smartModelName = await GeminiAPI.resolveSmartModel()
-            let takeoverSession = ScreenTakeoverSession(
-                goal: goal,
-                geminiAPI: GeminiAPI(model: smartModelName),
-                macActionRunner: self.macActionRunner,
-                showCursorAt: { [weak self] appKitPoint, displayFrame in
-                    guard let self else { return }
-                    // In Live mode the conversation is still listening; leave its state alone.
-                    if !self.isLiveSessionActive { self.voiceState = .idle }
-                    self.detectedElementBubbleText = "here"
-                    self.detectedElementDisplayFrame = displayFrame
-                    self.detectedElementScreenLocation = appKitPoint
-                }
-            )
-            let outcome = await takeoverSession.run()
-            OrchestraLog.write("🖱️ Takeover ended (finished: \(outcome.finished)): \(outcome.spokenSummary)")
+            let outcome: ScreenTakeoverSession.Outcome
+            if isWalkthrough {
+                let walkthroughSession = GuidedWalkthroughSession(
+                    goal: goal,
+                    geminiAPI: GeminiAPI(model: smartModelName),
+                    speakInstruction: { [weak self] instructionText in
+                        guard let self else { return }
+                        if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
+                            await liveSession.sendTextTurn("(walkthrough step from the screen guide, not the user) say this to the user in a few words, nothing else: \(instructionText)")
+                        } else {
+                            try? await self.speechOutputClient.speakText(instructionText)
+                        }
+                    },
+                    showPointer: { [weak self] appKitPoint, displayFrame, instructionText in
+                        guard let self else { return }
+                        if !self.isLiveSessionActive { self.voiceState = .idle }
+                        self.detectedElementBubbleText = instructionText
+                        self.detectedElementDisplayFrame = displayFrame
+                        self.detectedElementScreenLocation = appKitPoint
+                    }
+                )
+                outcome = await walkthroughSession.run()
+            } else {
+                let takeoverSession = ScreenTakeoverSession(
+                    goal: goal,
+                    geminiAPI: GeminiAPI(model: smartModelName),
+                    macActionRunner: self.macActionRunner,
+                    showCursorAt: { [weak self] appKitPoint, displayFrame in
+                        guard let self else { return }
+                        // In Live mode the conversation is still listening; leave its state alone.
+                        if !self.isLiveSessionActive { self.voiceState = .idle }
+                        self.detectedElementBubbleText = "here"
+                        self.detectedElementDisplayFrame = displayFrame
+                        self.detectedElementScreenLocation = appKitPoint
+                    }
+                )
+                outcome = await takeoverSession.run()
+            }
+            OrchestraLog.write("\(isWalkthrough ? "🧭 Walkthrough" : "🖱️ Takeover") ended (finished: \(outcome.finished)): \(outcome.spokenSummary)")
             let wasStoppedByUser = self.stoppedTakeoverStartNumber == thisTakeoverStartNumber
             self.conversationHistory.append((
-                userTranscript: "(screen takeover \(wasStoppedByUser ? "stopped by the user" : "ended")) goal: \(goal)",
+                userTranscript: "(\(isWalkthrough ? "show-me-how walkthrough" : "screen takeover") \(wasStoppedByUser ? "stopped by the user" : "ended")) goal: \(goal)",
                 assistantResponse: outcome.spokenSummary
             ))
             // Stopped in Live mode on purpose: the live voice already answered "stopped".
             if wasStoppedByUser && self.isLiveSessionActive { return }
             if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
                 // Live mode: let the live voice say how it went.
-                await liveSession.sendTextTurn("(note from the screen agent, not the user) the screen takeover \(outcome.finished ? "finished" : "stopped"): \(outcome.spokenSummary) — tell the user in one short sentence; if it asked a question, ask them that question.")
+                await liveSession.sendTextTurn("(note from the screen agent, not the user) the \(isWalkthrough ? "walkthrough" : "screen takeover") \(outcome.finished ? "finished" : "stopped"): \(outcome.spokenSummary) — tell the user in one short sentence; if it asked a question, ask them that question.")
             } else {
                 try? await self.speechOutputClient.speakText(outcome.spokenSummary)
             }
