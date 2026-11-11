@@ -281,28 +281,33 @@ final class CompanionManager: ObservableObject {
             await previousAnnouncementTask?.value
             guard let self else { return }
             OrchestraLog.write("📣 Job announcement: \(announcement.prefix(120))")
-            if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
-                await liveSession.sendTextTurn("(note from orchestra, not the user) a background job just finished: \(announcement) — tell the user in one or two short sentences.")
-                return
-            }
-            // Wait for a quiet moment (up to 10 minutes; the notification is already shown).
+            let liveNoteText = "(note from orchestra, not the user) a background job just finished: \(announcement) — tell the user in one or two short sentences."
             let waitStartDate = Date()
-            // (.responding can linger after speech ends, so only listening/thinking/speaking count as busy.)
-            while self.voiceState == .listening || self.voiceState == .processing
-                    || self.speechOutputClient.isPlaying || self.buddyDictationManager.isDictationInProgress {
-                if Date().timeIntervalSince(waitStartDate) > 600 { return }
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                // Live mode may have started while waiting.
+            while Date().timeIntervalSince(waitStartDate) < 600 {
                 if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
-                    await liveSession.sendTextTurn("(note from orchestra, not the user) a background job just finished: \(announcement) — tell the user in one or two short sentences.")
-                    return
+                    // Up to a minute for a pause in the conversation.
+                    if await liveSession.sendTextTurn(liveNoteText, maximumWaitSeconds: 60) {
+                        // Let the live voice start answering before the next note goes in.
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        return
+                    }
+                } else {
+                    // (.responding can linger after speech ends, so only listening/thinking/speaking count as busy.)
+                    let isBusy = self.voiceState == .listening || self.voiceState == .processing
+                        || self.speechOutputClient.isPlaying || self.buddyDictationManager.isDictationInProgress
+                    if !isBusy {
+                        try? await self.speechOutputClient.speakText(announcement)
+                        // speakText returns once playback starts; finish (at most 2 minutes) before the next one.
+                        let playbackStartDate = Date()
+                        while self.speechOutputClient.isPlaying && Date().timeIntervalSince(playbackStartDate) < 120 {
+                            try? await Task.sleep(nanoseconds: 300_000_000)
+                        }
+                        return
+                    }
                 }
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
-            try? await self.speechOutputClient.speakText(announcement)
-            // speakText returns once playback starts; finish before the next one.
-            while self.speechOutputClient.isPlaying {
-                try? await Task.sleep(nanoseconds: 300_000_000)
-            }
+            OrchestraLog.write("📣 Gave up announcing after 10 minutes (the notification is still there)")
         }
     }
 
