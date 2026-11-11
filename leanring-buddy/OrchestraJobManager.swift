@@ -263,12 +263,30 @@ final class OrchestraJobManager: ObservableObject {
                 : "hermes couldn't check that just now."
         } else {
             announcement = succeeded
-                ? "your job, \(job.title), is done. open it from the jobs list to see the note."
+                ? "your job, \(job.title), is done. \(Self.shortSpokenSummary(of: resultText))"
                 : "heads up, your job, \(job.title), didn't finish."
         }
         onJobFinishedAnnouncement?(announcement)
         postNotification(title: succeeded ? "Job done: \(job.title)" : "Job failed: \(job.title)",
                          body: String(resultText.prefix(220)))
+    }
+
+    /// The first sentence or two of a result, without markdown, for speaking.
+    static func shortSpokenSummary(of resultText: String) -> String {
+        let plainText = resultText
+            .replacingOccurrences(of: #"[#*_`>|\[\]]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\(https?://[^)]*\)"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !plainText.isEmpty else { return "the note is in the jobs list." }
+        var summary = ""
+        for sentence in plainText.components(separatedBy: ". ") {
+            let candidate = summary.isEmpty ? sentence : summary + ". " + sentence
+            if candidate.count > 220 { break }
+            summary = candidate
+        }
+        if summary.isEmpty { summary = String(plainText.prefix(200)) }
+        return summary.hasSuffix(".") ? summary : summary + "."
     }
 
     // MARK: - Context for the voice model

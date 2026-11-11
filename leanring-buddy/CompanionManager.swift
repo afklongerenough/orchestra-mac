@@ -247,10 +247,7 @@ final class CompanionManager: ObservableObject {
         bindAudioPowerLevel()
         bindShortcutTransitions()
         orchestraJobManager.onJobFinishedAnnouncement = { [weak self] announcement in
-            guard let self else { return }
-            // Don't talk over an answer that's already playing.
-            guard self.voiceState == .idle && !self.speechOutputClient.isPlaying else { return }
-            Task { try? await self.speechOutputClient.speakText(announcement) }
+            self?.queueJobAnnouncement(announcement)
         }
         connectJobManagerToMacActions()
         observeScreenCapturesForFlash()
@@ -267,6 +264,45 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+        }
+    }
+
+    // MARK: - Job announcements
+
+    /// Announcements wait in line so two jobs finishing together are both said.
+    private var jobAnnouncementChainTask: Task<Void, Never>?
+
+    /// Says a finished job out loud — never dropped. In Live mode the live
+    /// voice says it (when nobody is talking); otherwise it waits until
+    /// Orchestra is idle and not speaking, then uses the normal voice.
+    private func queueJobAnnouncement(_ announcement: String) {
+        let previousAnnouncementTask = jobAnnouncementChainTask
+        jobAnnouncementChainTask = Task { [weak self] in
+            await previousAnnouncementTask?.value
+            guard let self else { return }
+            OrchestraLog.write("📣 Job announcement: \(announcement.prefix(120))")
+            if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
+                await liveSession.sendTextTurn("(note from orchestra, not the user) a background job just finished: \(announcement) — tell the user in one or two short sentences.")
+                return
+            }
+            // Wait for a quiet moment (up to 10 minutes; the notification is already shown).
+            let waitStartDate = Date()
+            // (.responding can linger after speech ends, so only listening/thinking/speaking count as busy.)
+            while self.voiceState == .listening || self.voiceState == .processing
+                    || self.speechOutputClient.isPlaying || self.buddyDictationManager.isDictationInProgress {
+                if Date().timeIntervalSince(waitStartDate) > 600 { return }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                // Live mode may have started while waiting.
+                if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
+                    await liveSession.sendTextTurn("(note from orchestra, not the user) a background job just finished: \(announcement) — tell the user in one or two short sentences.")
+                    return
+                }
+            }
+            try? await self.speechOutputClient.speakText(announcement)
+            // speakText returns once playback starts; finish before the next one.
+            while self.speechOutputClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
         }
     }
 
