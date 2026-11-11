@@ -19,6 +19,7 @@ enum KeychainStore {
         case spotifyClientID = "spotify-client-id"
         case spotifyClientSecret = "spotify-client-secret"
         case openCodeAPIKey = "opencode-api-key"
+        case spotifyRefreshToken = "spotify-refresh-token"
     }
 
     static func read(_ key: Key) -> String? {

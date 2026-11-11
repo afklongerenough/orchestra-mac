@@ -205,7 +205,7 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "mac_action",
-            "description": "Do one quick thing on the Mac right now: 'spotify play <what>', 'spotify pause', 'spotify next', 'open_app <name>', 'open_url <link>', 'volume <0-100>', 'type <text>' (writes into the field that has focus), 'key <combo>' (e.g. 'key cmd+c' copies what's selected, 'key cmd+v' pastes, 'key cmd+a' selects all), 'scroll <lines>'. Never for sending, posting, buying or deleting.",
+            "description": "Do one quick thing on the Mac right now: 'spotify play <what>', 'spotify pause', 'spotify next', 'open_app <name>', 'open_url <link>', 'volume <0-100>', 'type <text>' (writes into the field that has focus), 'key <combo>' (e.g. 'key cmd+c' copies what's selected, 'key cmd+v' pastes, 'key cmd+a' selects all), 'scroll <lines>'. For 'spotify play <song>' use 'song by artist' when the user named one, otherwise just the song (their listening history picks the version). The result says what is actually playing: tell the user that, not what you asked for. Never for sending, posting, buying or deleting.",
             "parameters": stringParameters(["action"], required: ["action"])
         ],
         [

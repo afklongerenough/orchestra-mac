@@ -241,6 +241,7 @@ final class CompanionManager: ObservableObject {
     func start() {
         refreshAllPermissions()
         OrchestraUpdater.shared.startPeriodicChecks()
+        SpotifyLibrary.shared.startRecordingLocalHistory()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
@@ -735,7 +736,7 @@ final class CompanionManager: ObservableObject {
     you can act on this mac right away by adding action tags BEFORE the point tag. use them whenever the user asks you to play, pause, skip, open, go to, type, or change volume. keep the spoken line short ("playing it now", "opening notion").
     available actions, one per tag, several allowed:
     [ACTION: spotify play] [ACTION: spotify pause] [ACTION: spotify next] [ACTION: spotify previous]
-    [ACTION: spotify play <what to play>] — e.g. [ACTION: spotify play lofi beats playlist] or [ACTION: spotify play blinding lights the weeknd]. a spotify link or spotify: uri also works.
+    [ACTION: spotify play <what to play>] — e.g. [ACTION: spotify play lofi beats playlist], [ACTION: spotify play blinding lights by the weeknd], or just the song name if they didn't say the artist ([ACTION: spotify play stay high]); their own listening history picks the right version. a spotify link or spotify: uri also works. keep the spoken line general ("putting it on now"); if a different song ends up playing, orchestra says so.
     [ACTION: open_app <app name>] — e.g. [ACTION: open_app Notion]
     [ACTION: open_url <link>] — e.g. [ACTION: open_url https://example.com]
     [ACTION: volume <0-100>]
@@ -949,6 +950,9 @@ final class CompanionManager: ObservableObject {
                     if !failedActionResults.isEmpty && failedActionResults.count == actionResults.count {
                         let failureReason = failedActionResults.first?.detail ?? "something went wrong"
                         spokenText = "hmm, i couldn't do that on your mac: \(failureReason)."
+                    } else if let spokenCorrection = actionResults.compactMap(\.spokenCorrection).first {
+                        // e.g. a different song than the one named is playing: say what really happened.
+                        spokenText = spokenCorrection
                     }
                 }
 
@@ -1106,7 +1110,8 @@ final class CompanionManager: ObservableObject {
                 }
                 let results = await self.macActionRunner.runActions([actionText])
                 guard let result = results.first else { return "no result" }
-                return result.succeeded ? "done" : "failed: \(result.detail ?? "error")"
+                // Pass along what really happened (e.g. which song is playing) so the voice says the truth.
+                return result.succeeded ? "done\(result.detail.map { ": \($0)" } ?? "")" : "failed: \(result.detail ?? "error")"
             },
             startJob: { [weak self] place, brief in
                 guard let self else { return "not available" }

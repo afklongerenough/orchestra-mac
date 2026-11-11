@@ -15,6 +15,8 @@ struct CompanionPanelView: View {
     @State private var geminiAPIKeyInput: String = ""
     @State private var hermesBridgeURLInput: String = ""
     @ObservedObject private var orchestraUpdater = OrchestraUpdater.shared
+    @State private var spotifyAccountStatusText: String = ""
+    @State private var isConnectingSpotifyAccount = false
     /// Saved as soon as it's typed (no Save needed).
     @AppStorage("userDisplayName") private var userDisplayNameInput: String = ""
     @State private var hermesBridgeTokenInput: String = ""
@@ -885,6 +887,7 @@ struct CompanionPanelView: View {
                     isSecure: false
                 )
                 connectionTextField(placeholder: "Spotify client secret (optional)", text: $spotifyClientSecretInput, isSecure: true)
+                spotifyAccountRow
 
                 Button(action: {
                     companionManager.saveHermesBridgeSettings(
@@ -949,6 +952,50 @@ struct CompanionPanelView: View {
             RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                 .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
         )
+    }
+
+    // MARK: - Spotify account
+
+    /// Lets "play <song>" use the user's recently played and top tracks.
+    private var spotifyAccountRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(SpotifyLibrary.shared.isAccountConnected ? "Spotify history: connected" : "Spotify history: this Mac only")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Spacer()
+                if isConnectingSpotifyAccount {
+                    ProgressView().controlSize(.mini)
+                } else if SpotifyLibrary.shared.isAccountConnected {
+                    Button("Disconnect") {
+                        SpotifyLibrary.shared.disconnectAccount()
+                        spotifyAccountStatusText = "disconnected"
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .pointerCursor()
+                } else {
+                    Button("Connect account") {
+                        isConnectingSpotifyAccount = true
+                        Task {
+                            spotifyAccountStatusText = await SpotifyLibrary.shared.connectAccount()
+                            isConnectingSpotifyAccount = false
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.accent)
+                    .pointerCursor()
+                }
+            }
+            if !spotifyAccountStatusText.isEmpty {
+                Text(spotifyAccountStatusText)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     // MARK: - Updates

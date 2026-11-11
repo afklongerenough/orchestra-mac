@@ -32,7 +32,10 @@ import Foundation
 struct MacActionResult {
     let actionDescription: String
     let succeeded: Bool
-    let detail: String?
+    var detail: String?
+    /// Set when what happened differs from what was asked (e.g. a different
+    /// song is playing), so the spoken reply can say the truth.
+    var spokenCorrection: String? = nil
 }
 
 @MainActor
@@ -164,9 +167,23 @@ final class MacActionRunner {
             return playSpotifyURI(spotifyURI, description: description)
         }
 
-        // Search with the Web API when the user has saved a client id/secret.
-        if let foundURI = await searchSpotifyForURI(query: whatToPlay) {
-            return playSpotifyURI(foundURI, description: description)
+        // Search with the Web API when the user has saved a client id/secret,
+        // pick the best match using their listening history, then check what
+        // Spotify actually started so the reply never names the wrong song.
+        if let bestMatch = await findBestSpotifyMatch(for: whatToPlay) {
+            let playResult = playSpotifyURI(bestMatch.uri, description: description)
+            guard playResult.succeeded else { return playResult }
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            let nowPlaying = SpotifyLibrary.currentlyPlayingTrack(onlyWhilePlaying: false)
+            let playingName = nowPlaying?.name ?? bestMatch.name
+            let playingArtist = nowPlaying?.artistName ?? bestMatch.artistText
+            var result = MacActionResult(actionDescription: description, succeeded: true,
+                                         detail: "now playing: \(playingName) by \(playingArtist)")
+            if !bestMatch.isTitleMatch {
+                result.detail = "couldn't find an exact match for \"\(whatToPlay)\"; now playing: \(playingName) by \(playingArtist)"
+                result.spokenCorrection = "i couldn't find \(whatToPlay) exactly, so i'm playing \(playingName) by \(playingArtist)."
+            }
+            return result
         }
 
         // Fallback: open Spotify's own search page for it.
@@ -197,8 +214,17 @@ final class MacActionRunner {
         KeychainStore.read(.spotifyClientID) != nil && KeychainStore.read(.spotifyClientSecret) != nil
     }
 
-    /// Client-credentials search: finds the best playlist, album or track URI.
-    private func searchSpotifyForURI(query: String) async -> String? {
+    struct SpotifyMatch {
+        let uri: String
+        let name: String
+        let artistText: String
+        let isTitleMatch: Bool
+    }
+
+    /// Client-credentials search. Tracks: up to 20 results ranked with the
+    /// user's listening history (so "stay high" finds the one they play).
+    /// Playlists/albums: the first result.
+    private func findBestSpotifyMatch(for query: String) async -> SpotifyMatch? {
         guard let accessToken = await spotifyAccessToken() else { return nil }
 
         let lowercasedQuery = query.lowercased()
@@ -215,26 +241,63 @@ final class MacActionRunner {
             .replacingOccurrences(of: "album", with: "", options: .caseInsensitive)
             .trimmingCharacters(in: .whitespaces)
 
+        // "stay high by juice wrld" → title "stay high", artist "juice wrld".
+        var requestedTitle = cleanedQuery.isEmpty ? query : cleanedQuery
+        var requestedArtist: String?
+        if let byRange = requestedTitle.range(of: " by ", options: [.caseInsensitive, .backwards]) {
+            requestedArtist = String(requestedTitle[byRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+            requestedTitle = String(requestedTitle[..<byRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
+        let searchText: String
+        if preferredType == "track", let requestedArtist, !requestedArtist.isEmpty {
+            searchText = "track:\(requestedTitle) artist:\(requestedArtist)"
+        } else {
+            searchText = requestedArtist.map { "\(requestedTitle) \($0)" } ?? requestedTitle
+        }
+
+        var searchItems = await spotifySearchItems(searchText: searchText, type: preferredType,
+                                                  limit: preferredType == "track" ? 20 : 1, accessToken: accessToken)
+        // A strict field search can miss (odd spellings): retry as plain words.
+        if searchItems.isEmpty && searchText != cleanedQuery {
+            searchItems = await spotifySearchItems(searchText: cleanedQuery.isEmpty ? query : cleanedQuery, type: preferredType,
+                                                   limit: preferredType == "track" ? 20 : 1, accessToken: accessToken)
+        }
+        guard !searchItems.isEmpty else { return nil }
+
+        guard preferredType == "track" else {
+            guard let firstItem = searchItems.first, let uri = firstItem["uri"] as? String else { return nil }
+            return SpotifyMatch(uri: uri, name: firstItem["name"] as? String ?? query, artistText: "", isTitleMatch: true)
+        }
+        let candidates: [SpotifyTrackCandidate] = searchItems.compactMap { trackItem in
+            guard let uri = trackItem["uri"] as? String, let name = trackItem["name"] as? String else { return nil }
+            let artistNames = (trackItem["artists"] as? [[String: Any]])?.compactMap { $0["name"] as? String } ?? []
+            return SpotifyTrackCandidate(uri: uri, name: name, artistNames: artistNames, popularity: trackItem["popularity"] as? Int ?? 0)
+        }
+        guard let ranked = await SpotifyLibrary.shared.bestCandidate(from: candidates, requestedTitle: requestedTitle, requestedArtist: requestedArtist) else {
+            return nil
+        }
+        return SpotifyMatch(uri: ranked.candidate.uri, name: ranked.candidate.name,
+                            artistText: ranked.candidate.artistNames.joined(separator: ", "), isTitleMatch: ranked.isTitleMatch)
+    }
+
+    private func spotifySearchItems(searchText: String, type searchType: String, limit: Int, accessToken: String) async -> [[String: Any]] {
         var components = URLComponents(string: "https://api.spotify.com/v1/search")!
         components.queryItems = [
-            URLQueryItem(name: "q", value: cleanedQuery.isEmpty ? query : cleanedQuery),
-            URLQueryItem(name: "type", value: preferredType),
-            URLQueryItem(name: "limit", value: "1")
+            URLQueryItem(name: "q", value: searchText),
+            URLQueryItem(name: "type", value: searchType),
+            URLQueryItem(name: "limit", value: String(limit))
         ]
-        guard let searchURL = components.url else { return nil }
+        guard let searchURL = components.url else { return [] }
         var request = URLRequest(url: searchURL)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-
         guard let searchResponse = try? await session.data(for: request),
               (searchResponse.1 as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: searchResponse.0) as? [String: Any],
-              let section = json["\(preferredType)s"] as? [String: Any],
-              let items = section["items"] as? [Any],
-              let firstItem = items.compactMap({ $0 as? [String: Any] }).first,
-              let uri = firstItem["uri"] as? String else {
-            return nil
+              let section = json["\(searchType)s"] as? [String: Any],
+              let items = section["items"] as? [Any] else {
+            return []
         }
-        return uri
+        return items.compactMap { $0 as? [String: Any] }
     }
 
     private func spotifyAccessToken() async -> String? {
