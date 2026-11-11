@@ -175,7 +175,7 @@ final class OrchestraUpdater: ObservableObject {
         relaunchProcess.arguments = [
             "-c",
             // Only reopen if the old copy really quit (never two copies with two hotkeys).
-            "for attempt in $(seq 1 150); do /bin/kill -0 \"$1\" 2>/dev/null || { /usr/bin/open \"$0\"; exit 0; }; sleep 0.2; done",
+            "for attempt in $(seq 1 150); do /bin/kill -0 \"$1\" 2>/dev/null || { /usr/bin/open \"$0\"; exit 0; }; sleep 0.2; done; /usr/bin/open \"$0\"",
             installedAppURL.path,
             String(ProcessInfo.processInfo.processIdentifier)
         ]

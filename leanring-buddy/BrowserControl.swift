@@ -50,7 +50,7 @@ enum BrowserControl {
     /// for the safety gate, so they always agree. Never reads what's typed in
     /// text/password/card fields — only what a button says.
     private static let elementLabelJavaScriptFunction = """
-    function orchestraLabel(node) {
+    function orchestraLabel(node, maximumLength) {
       var isButtonLikeInput = node.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(node.type || '');
       var imageAlt = '';
       var innerImage = node.querySelector ? node.querySelector('img[alt], svg[aria-label]') : null;
@@ -58,7 +58,7 @@ enum BrowserControl {
       var parts = [node.getAttribute('aria-label'), (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? '' : node.innerText,
                    isButtonLikeInput ? node.value : '', node.getAttribute('placeholder'), node.getAttribute('title'),
                    node.getAttribute('name'), imageAlt];
-      return parts.filter(function (part) { return part; }).join(' ').replace(/\\s+/g, ' ').trim().slice(0, 100);
+      return parts.filter(function (part) { return part; }).join(' ').replace(/\\s+/g, ' ').trim().slice(0, maximumLength || 100);
     }
     """
 
@@ -69,7 +69,7 @@ enum BrowserControl {
         (function () {
           document.querySelectorAll('[data-orch-id]').forEach(function (node) { node.removeAttribute('data-orch-id'); });
           \(elementLabelJavaScriptFunction)
-          var selector = 'a[href], button, input, textarea, select, [role=button], [role=link], [role=tab], [role=menuitem], [role=checkbox], [role=option], [contenteditable=true], summary';
+          var selector = 'a[href], button, input, textarea, [role=button], [role=link], [role=tab], [role=menuitem], [role=checkbox], [role=option], [contenteditable=true], summary';
           var lines = [];
           var nextId = 1;
           var nodes = document.querySelectorAll(selector);
@@ -102,7 +102,9 @@ enum BrowserControl {
     static func clickElement(id elementIdentifier: Int) throws -> String {
         let elementLabel = try describeElement(id: elementIdentifier)
         // An unlabelled control could be an icon-only Send or Delete: don't guess.
-        guard elementLabel != "(no label)" else {
+        // Fewer than three letters (an icon like "➤") says nothing about what it does.
+        let letterCount = elementLabel.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        guard elementLabel != "(no label)", letterCount >= 3 else {
             throw BrowserError(message: "element \(elementIdentifier) has no label, so i can't tell what it does; that click is the user's")
         }
         if elementLabel.range(of: ScreenControl.irreversibleWordsPatternForSharing, options: [.regularExpression, .caseInsensitive]) != nil {
@@ -120,7 +122,7 @@ enum BrowserControl {
         """
         let result = try runJavaScriptInFrontTab(javaScript)
         guard result == "clicked" else { throw BrowserError(message: "element \(elementIdentifier) is gone; read the page again") }
-        return "clicked \"\(elementLabel)\""
+        return "clicked \"\(elementLabel.prefix(100))\""
     }
 
     /// Types text into a field by id (replaces what's there). Never into password fields.
@@ -189,7 +191,10 @@ enum BrowserControl {
           \(elementLabelJavaScriptFunction)
           var node = document.querySelector('[data-orch-id="\(elementIdentifier)"]');
           if (!node) return '';
-          return orchestraLabel(node) || '(no label)';
+          // Full length (no cut-off) plus the visible text on its own, for the safety check.
+          var fullLabel = orchestraLabel(node, 2000);
+          var visibleText = (node.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 2000);
+          return (fullLabel + (visibleText && fullLabel.indexOf(visibleText) < 0 ? ' ' + visibleText : '')) || '(no label)';
         })()
         """
         let label = try runJavaScriptInFrontTab(javaScript)
