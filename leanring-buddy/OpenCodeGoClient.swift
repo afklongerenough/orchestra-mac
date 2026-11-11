@@ -68,7 +68,8 @@ final class OpenCodeGoClient {
                 systemPrompt: String,
                 conversationHistory: [(userPlaceholder: String, assistantResponse: String)],
                 userPrompt: String,
-                imageMimeType: (Data) -> String) async throws -> String {
+                imageMimeType: (Data) -> String,
+                modelOverride: String? = nil) async throws -> String {
         var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
         for (userText, assistantText) in conversationHistory {
             messages.append(["role": "user", "content": userText])
@@ -83,11 +84,13 @@ final class OpenCodeGoClient {
         currentContentParts.append(["type": "text", "text": userPrompt])
         messages.append(["role": "user", "content": currentContentParts])
 
+        // A model override (screen takeover) wants precise, steady answers and
+        // room for reasoning models to think before replying.
         let responseJSON = try await postChatCompletion(body: [
-            "model": BrainProvider.openCodeModel,
+            "model": modelOverride ?? BrainProvider.openCodeModel,
             "messages": messages,
-            "max_tokens": 2048,
-            "temperature": 0.7
+            "max_tokens": modelOverride == nil ? 2048 : 6144,
+            "temperature": modelOverride == nil ? 0.7 : 0.2
         ])
         guard let message = Self.firstMessage(in: responseJSON) else {
             throw OpenCodeGoError(message: "opencode returned no answer", statusCode: 0)

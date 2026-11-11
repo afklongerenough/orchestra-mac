@@ -41,6 +41,20 @@ enum ScreenControl {
         )
     }
 
+    /// A point on a 0–1000 grid over the screenshot (0,0 top-left, 1000,1000
+    /// bottom-right) → AppKit global point. Vision models place things much
+    /// more accurately on this grid than in raw pixels of a resized image.
+    static func appKitGlobalPoint(fromNormalizedPoint normalizedPoint: CGPoint,
+                                  in screenCapture: CompanionScreenCapture) -> CGPoint {
+        let clampedNormalizedX = max(0, min(normalizedPoint.x, 1000))
+        let clampedNormalizedY = max(0, min(normalizedPoint.y, 1000))
+        let screenshotPoint = CGPoint(
+            x: clampedNormalizedX / 1000 * CGFloat(screenCapture.screenshotWidthInPixels),
+            y: clampedNormalizedY / 1000 * CGFloat(screenCapture.screenshotHeightInPixels)
+        )
+        return appKitGlobalPoint(fromScreenshotPoint: screenshotPoint, in: screenCapture)
+    }
+
     /// AppKit global (bottom-left origin) → Quartz global (top-left origin of
     /// the primary display), which is what CGEvent expects.
     static func quartzGlobalPoint(fromAppKitGlobalPoint appKitPoint: CGPoint) -> CGPoint {
@@ -55,6 +69,8 @@ enum ScreenControl {
     enum MouseClickKind {
         case left
         case double
+        /// Selects a whole line/paragraph of text.
+        case triple
         case right
     }
 
@@ -77,10 +93,45 @@ enum ScreenControl {
             usleep(80_000)
             postMouseButtonPair(at: quartzPoint, downType: .leftMouseDown, upType: .leftMouseUp,
                                 button: .left, clickCount: 2, eventSource: eventSource)
+        case .triple:
+            for clickNumber in 1...3 {
+                postMouseButtonPair(at: quartzPoint, downType: .leftMouseDown, upType: .leftMouseUp,
+                                    button: .left, clickCount: Int64(clickNumber), eventSource: eventSource)
+                usleep(80_000)
+            }
         case .right:
             postMouseButtonPair(at: quartzPoint, downType: .rightMouseDown, upType: .rightMouseUp,
                                 button: .right, clickCount: 1, eventSource: eventSource)
         }
+    }
+
+    /// Press at one point, move to another, release: selects text (or drags a thing).
+    static func drag(fromAppKitGlobalPoint startAppKitPoint: CGPoint, toAppKitGlobalPoint endAppKitPoint: CGPoint) {
+        let startQuartzPoint = quartzGlobalPoint(fromAppKitGlobalPoint: startAppKitPoint)
+        let endQuartzPoint = quartzGlobalPoint(fromAppKitGlobalPoint: endAppKitPoint)
+        let eventSource = CGEventSource(stateID: .combinedSessionState)
+
+        CGEvent(mouseEventSource: eventSource, mouseType: .mouseMoved,
+                mouseCursorPosition: startQuartzPoint, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(60_000)
+        CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseDown,
+                mouseCursorPosition: startQuartzPoint, mouseButton: .left)?.post(tap: .cghidEventTap)
+        usleep(80_000)
+        // Several small moves so apps see a real drag, not a jump.
+        let dragStepCount = 12
+        for dragStepNumber in 1...dragStepCount {
+            let progress = CGFloat(dragStepNumber) / CGFloat(dragStepCount)
+            let intermediatePoint = CGPoint(
+                x: startQuartzPoint.x + (endQuartzPoint.x - startQuartzPoint.x) * progress,
+                y: startQuartzPoint.y + (endQuartzPoint.y - startQuartzPoint.y) * progress
+            )
+            CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseDragged,
+                    mouseCursorPosition: intermediatePoint, mouseButton: .left)?.post(tap: .cghidEventTap)
+            usleep(16_000)
+        }
+        usleep(60_000)
+        CGEvent(mouseEventSource: eventSource, mouseType: .leftMouseUp,
+                mouseCursorPosition: endQuartzPoint, mouseButton: .left)?.post(tap: .cghidEventTap)
     }
 
     private static func postMouseButtonPair(at quartzPoint: CGPoint,

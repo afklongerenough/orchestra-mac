@@ -32,11 +32,12 @@ final class GeminiLiveSession: NSObject {
 
     /// Tools the live model can call. CompanionManager implements them.
     struct ToolHandlers {
-        /// (x, y) in the latest screen frame's pixels → points the cursor.
-        let pointAt: (_ screenshotX: Double, _ screenshotY: Double, _ label: String, _ screenCapture: CompanionScreenCapture) -> Void
+        /// (x, y) on a 0–1000 grid over the latest screen frame → points the blue cursor.
+        let pointAt: (_ normalizedX: Double, _ normalizedY: Double, _ label: String, _ screenCapture: CompanionScreenCapture) -> Void
         let runMacAction: (_ action: String) async -> String
         let startJob: (_ place: OrchestraJobPlace, _ brief: String) -> String
         let takeOverScreen: (_ goal: String) -> String
+        let stopTakeover: () -> String
         let addRoutine: (_ schedule: String, _ place: OrchestraJobPlace, _ brief: String) -> String
         let recentJobsSummary: () -> String
     }
@@ -189,7 +190,7 @@ final class GeminiLiveSession: NSObject {
     private static let liveFunctionDeclarations: [[String: Any]] = [
         [
             "name": "point_at",
-            "description": "Fly the blue cursor to a spot on the screen. x and y are pixels in the latest screen frame (top-left origin).",
+            "description": "Fly the blue cursor to a spot on the screen. x and y are on a 0-1000 grid over the latest screen frame: 0,0 = top-left corner, 1000,1000 = bottom-right, 500,500 = center (whatever the image size). Aim at the center of the thing.",
             "parameters": [
                 "type": "object",
                 "properties": [
@@ -202,7 +203,7 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "mac_action",
-            "description": "Do one quick thing on the Mac: 'spotify play <what>', 'spotify pause', 'spotify next', 'open_app <name>', 'open_url <link>', 'volume <0-100>', 'type <text>', 'key <combo>', 'scroll <lines>'. Never for sending, posting, buying or deleting.",
+            "description": "Do one quick thing on the Mac right now: 'spotify play <what>', 'spotify pause', 'spotify next', 'open_app <name>', 'open_url <link>', 'volume <0-100>', 'type <text>' (writes into the field that has focus), 'key <combo>' (e.g. 'key cmd+c' copies what's selected, 'key cmd+v' pastes, 'key cmd+a' selects all), 'scroll <lines>'. Never for sending, posting, buying or deleting.",
             "parameters": stringParameters(["action"], required: ["action"])
         ],
         [
@@ -212,8 +213,13 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "take_over_screen",
-            "description": "Drive the screen (click, type, keys) to finish a multi-step task in an app. Stops before send/buy/delete and asks the user.",
+            "description": "Drive the screen (click, select, type, keys) to finish a task that needs clicking or selecting. Runs in the background while you keep talking; you'll get a message when it finishes. The goal must stand on its own, since the screen agent can't hear you: say exactly what to do and quote the visible text/element (e.g. 'select the paragraph that starts with Dear team in the Mail window and copy it'). Stops before send/buy/delete and asks the user.",
             "parameters": stringParameters(["goal"], required: ["goal"])
+        ],
+        [
+            "name": "stop_screen_takeover",
+            "description": "Stop a running take_over_screen right away (when the user says stop / wait / cancel).",
+            "parameters": stringParameters([], required: [])
         ],
         [
             "name": "add_routine",
@@ -350,6 +356,8 @@ final class GeminiLiveSession: NSObject {
             return toolHandlers.startJob(place, arguments["brief"] as? String ?? "")
         case "take_over_screen":
             return toolHandlers.takeOverScreen(arguments["goal"] as? String ?? "")
+        case "stop_screen_takeover":
+            return toolHandlers.stopTakeover()
         case "add_routine":
             let place: OrchestraJobPlace = (arguments["place"] as? String)?.lowercased() == "mac" ? .mac : .hermes
             return toolHandlers.addRoutine(arguments["schedule"] as? String ?? "", place, arguments["brief"] as? String ?? "")
@@ -373,6 +381,14 @@ final class GeminiLiveSession: NSObject {
     }
 
     // MARK: - Sending
+
+    /// Tells the live model something happened (e.g. a takeover finished) so it
+    /// says it out loud. Uses clientContent, which starts a model turn.
+    func sendTextTurn(_ noteText: String) {
+        guard liveState == .live else { return }
+        let userTurn: [String: Any] = ["role": "user", "parts": [["text": noteText]]]
+        sendJSON(["clientContent": ["turns": [userTurn], "turnComplete": true]])
+    }
 
     /// False when there's no open connection (nothing was sent).
     @discardableResult

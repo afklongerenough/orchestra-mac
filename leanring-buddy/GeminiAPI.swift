@@ -133,6 +133,7 @@ final class GeminiAPI {
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
         userPrompt: String,
+        openCodeModelOverride: String? = nil,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
         if BrainProvider.current == .opencodeGo {
@@ -143,7 +144,8 @@ final class GeminiAPI {
                     systemPrompt: systemPrompt,
                     conversationHistory: conversationHistory,
                     userPrompt: userPrompt,
-                    imageMimeType: { [weak self] imageData in self?.detectImageMimeType(for: imageData) ?? "image/jpeg" }
+                    imageMimeType: { [weak self] imageData in self?.detectImageMimeType(for: imageData) ?? "image/jpeg" },
+                    modelOverride: openCodeModelOverride
                 )
                 await onTextChunk(openCodeAnswer)
                 return (text: openCodeAnswer, duration: Date().timeIntervalSince(openCodeStartTime))
