@@ -14,6 +14,7 @@ struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @State private var geminiAPIKeyInput: String = ""
     @State private var hermesBridgeURLInput: String = ""
+    @ObservedObject private var orchestraUpdater = OrchestraUpdater.shared
     /// Saved as soon as it's typed (no Save needed).
     @AppStorage("userDisplayName") private var userDisplayNameInput: String = ""
     @State private var hermesBridgeTokenInput: String = ""
@@ -102,6 +103,10 @@ struct CompanionPanelView: View {
             Divider()
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
+
+            updateSection
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
 
             footerSection
                 .padding(.horizontal, 16)
@@ -944,6 +949,61 @@ struct CompanionPanelView: View {
             RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                 .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
         )
+    }
+
+    // MARK: - Updates
+
+    private var updateSection: some View {
+        HStack(spacing: 8) {
+            Text("Build \(orchestraUpdater.currentBuildNumber)")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+            Spacer()
+            switch orchestraUpdater.updateState {
+            case .idle:
+                checkForUpdatesButton
+            case .upToDate:
+                Text("Up to date")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                checkForUpdatesButton
+            case .failed(let failureMessage):
+                Text(failureMessage)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .lineLimit(2)
+                    .help(failureMessage)
+                checkForUpdatesButton
+            case .checking:
+                ProgressView().controlSize(.mini)
+                Text("Checking…")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+            case .available(let availableBuildNumber):
+                Button("Update to build \(availableBuildNumber)") {
+                    Task { await orchestraUpdater.installAvailableUpdate() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Colors.accent)
+                .pointerCursor()
+            case .installing(let currentStep):
+                ProgressView().controlSize(.mini)
+                Text(currentStep.prefix(1).uppercased() + currentStep.dropFirst() + "…")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+        }
+    }
+
+    private var checkForUpdatesButton: some View {
+        Button("Check for updates") {
+            Task { await orchestraUpdater.checkForUpdates() }
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 11, weight: .medium))
+        .foregroundColor(DS.Colors.textSecondary)
+        .pointerCursor()
     }
 
     // MARK: - Footer

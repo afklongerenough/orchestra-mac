@@ -240,6 +240,7 @@ final class CompanionManager: ObservableObject {
 
     func start() {
         refreshAllPermissions()
+        OrchestraUpdater.shared.startPeriodicChecks()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()

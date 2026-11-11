@@ -2,11 +2,11 @@
 # MacBook) and publishes Orchestra.dmg as a workflow artifact and as the
 # "latest" release asset.
 #
-# The app is ad-hoc signed (no Apple Developer account), so after
-# installing you may need to clear the quarantine flag once:
+# The app is signed with a self-signed certificate (no Apple Developer
+# account) kept in the ORCHESTRA_SIGNING_P12 secret, so macOS keeps its
+# permissions across builds. Clear the quarantine flag once after the
+# first manual install:
 #   xattr -dr com.apple.quarantine /Applications/Orchestra.app
-# and macOS will ask for Screen Recording / Accessibility / Microphone
-# again after each new build.
 
 name: Build Orchestra DMG
 
@@ -22,6 +22,10 @@ jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 40
+    env:
+      # Forks don't have the signing secret; they fall back to ad-hoc signing.
+      HAS_SIGNING_CERTIFICATE: ${{ secrets.ORCHESTRA_SIGNING_P12 != '' }}
+      SIGNING_IDENTITY_NAME: Orchestra Self-Signed Code Signing
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +44,7 @@ jobs:
             -skipPackagePluginValidation \
             -skipMacroValidation \
             CODE_SIGN_IDENTITY="-" \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
             CODE_SIGN_STYLE=Manual \
             ENABLE_HARDENED_RUNTIME=NO \
             DEVELOPMENT_TEAM="" \
@@ -58,12 +63,45 @@ jobs:
           name: build-log
           path: build.log
 
-      - name: Re-sign whole bundle ad-hoc
+      # Signing every build with the same certificate keeps macOS permissions
+      # (microphone, screen, accessibility, Keychain "Always Allow") across
+      # updates, and lets the in-app updater check a download really is ours.
+      - name: Import signing certificate
+        if: env.HAS_SIGNING_CERTIFICATE == 'true'
+        env:
+          SIGNING_P12_BASE64: ${{ secrets.ORCHESTRA_SIGNING_P12 }}
+          SIGNING_P12_PASSWORD: ${{ secrets.ORCHESTRA_SIGNING_P12_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/orchestra-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$SIGNING_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN_PATH" -P "$SIGNING_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          # A self-signed certificate has to be trusted for code signing on this runner.
+          security find-certificate -c "$SIGNING_IDENTITY_NAME" -p "$KEYCHAIN_PATH" > "$RUNNER_TEMP/signing-cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/signing-cert.pem" \
+            || echo "::warning::could not mark the signing certificate as trusted"
+          echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Re-sign whole bundle
         run: |
           APP="build/Build/Products/Release/Orchestra.app"
-          codesign --force --deep --sign - \
-            --entitlements leanring-buddy/leanring-buddy.entitlements "$APP"
+          if [ "$HAS_SIGNING_CERTIFICATE" = "true" ]; then
+            codesign --force --deep --sign "$SIGNING_IDENTITY_NAME" --keychain "$SIGNING_KEYCHAIN_PATH" \
+              --timestamp=none --entitlements leanring-buddy/leanring-buddy.entitlements "$APP"
+          else
+            codesign --force --deep --sign - \
+              --entitlements leanring-buddy/leanring-buddy.entitlements "$APP"
+          fi
           codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "Designated requirement:"
+          codesign -d -r- "$APP" 2>&1 | tail -1
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Contents/Info.plist"
 
       - name: Make DMG
         run: |
@@ -86,5 +124,5 @@ jobs:
           TAG="build-${GITHUB_RUN_NUMBER}"
           gh release create "$TAG" Orchestra.dmg \
             --title "Orchestra build ${GITHUB_RUN_NUMBER}" \
-            --notes "Built from ${GITHUB_SHA::7}. Ad-hoc signed: after dragging to Applications run: xattr -dr com.apple.quarantine /Applications/Orchestra.app" \
+            --notes "Built from ${GITHUB_SHA::7}. Signed with Orchestra's own (self-signed) certificate. First install: after dragging to Applications run: xattr -dr com.apple.quarantine /Applications/Orchestra.app. Later updates: use Check for updates in the Orchestra menu." \
             --latest
