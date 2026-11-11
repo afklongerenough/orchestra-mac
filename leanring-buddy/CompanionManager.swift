@@ -557,7 +557,7 @@ final class CompanionManager: ObservableObject {
             if isLiveModeEnabled {
                 // During a live takeover, a tap stops the takeover but keeps the conversation.
                 if isScreenTakeoverRunning && isLiveSessionActive {
-                    currentScreenTakeoverTask?.cancel()
+                    stopRunningScreenTakeover()
                     return
                 }
                 currentScreenTakeoverTask?.cancel()
@@ -1037,7 +1037,8 @@ final class CompanionManager: ObservableObject {
 
         let toolHandlers = GeminiLiveSession.ToolHandlers(
             pointAt: { [weak self] normalizedX, normalizedY, label, screenCapture in
-                guard let self else { return }
+                // The screen agent owns the cursor while it works.
+                guard let self, !self.isScreenTakeoverRunning else { return }
                 let appKitPoint = ScreenControl.appKitGlobalPoint(
                     fromNormalizedPoint: CGPoint(x: normalizedX, y: normalizedY), in: screenCapture)
                 self.detectedElementBubbleText = label
@@ -1046,6 +1047,9 @@ final class CompanionManager: ObservableObject {
             },
             runMacAction: { [weak self] actionText in
                 guard let self else { return "not available" }
+                if self.isScreenTakeoverRunning {
+                    return "not done: the screen agent is still working. wait for it to report back, or call stop_screen_takeover first."
+                }
                 let results = await self.macActionRunner.runActions([actionText])
                 guard let result = results.first else { return "no result" }
                 return result.succeeded ? "done" : "failed: \(result.detail ?? "error")"
@@ -1069,8 +1073,8 @@ final class CompanionManager: ObservableObject {
                 return "started. it's working on the screen now; say one short line like 'on it' and don't use mac_action or point_at until it reports back. if the user says stop, call stop_screen_takeover."
             },
             stopTakeover: { [weak self] in
-                guard let self, let runningTakeoverTask = self.currentScreenTakeoverTask else { return "nothing was running" }
-                runningTakeoverTask.cancel()
+                guard let self, self.isScreenTakeoverRunning else { return "nothing was running" }
+                self.stopRunningScreenTakeover()
                 return "stopped"
             },
             addRoutine: { [weak self] scheduleText, place, brief in
@@ -1136,6 +1140,14 @@ final class CompanionManager: ObservableObject {
     private var screenTakeoverGeneration = 0
     private var isScreenTakeoverRunning = false
 
+    /// Stops the takeover right away (the flag clears now, not when the model call unwinds).
+    private func stopRunningScreenTakeover() {
+        currentScreenTakeoverTask?.cancel()
+        currentScreenTakeoverTask = nil
+        screenTakeoverGeneration += 1
+        isScreenTakeoverRunning = false
+    }
+
     private func startScreenTakeover(goal: String) {
         currentScreenTakeoverTask?.cancel()
         if ScreenSharingMode.current == .never {
@@ -1177,9 +1189,11 @@ final class CompanionManager: ObservableObject {
                 userTranscript: "(screen takeover finished) goal: \(goal)",
                 assistantResponse: outcome.spokenSummary
             ))
+            // Stopped on purpose (tap or "stop"): the user already knows.
+            guard self.screenTakeoverGeneration == thisTakeoverGeneration else { return }
             if self.isLiveSessionActive, let liveSession = self.geminiLiveSession {
                 // Live mode: let the live voice say how it went.
-                liveSession.sendTextTurn("(note from the screen agent, not the user) the screen takeover \(outcome.finished ? "finished" : "stopped"): \(outcome.spokenSummary) — tell the user in one short sentence; if it asked a question, ask them that question.")
+                await liveSession.sendTextTurn("(note from the screen agent, not the user) the screen takeover \(outcome.finished ? "finished" : "stopped"): \(outcome.spokenSummary) — tell the user in one short sentence; if it asked a question, ask them that question.")
             } else {
                 try? await self.speechOutputClient.speakText(outcome.spokenSummary)
             }

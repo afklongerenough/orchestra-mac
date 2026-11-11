@@ -384,7 +384,14 @@ final class GeminiLiveSession: NSObject {
 
     /// Tells the live model something happened (e.g. a takeover finished) so it
     /// says it out loud. Uses clientContent, which starts a model turn.
-    func sendTextTurn(_ noteText: String) {
+    /// Waits (up to ~10 s) for a quiet moment so it doesn't cut off the user or itself.
+    func sendTextTurn(_ noteText: String) async {
+        for _ in 0..<40 {
+            let isModelSpeaking = Date() < modelSpeechPlaysUntil.addingTimeInterval(Self.speechEchoTailSeconds)
+            let userSpokeRecently = Date().timeIntervalSince(lastUserSpeechDate) < 1.5
+            if !isModelSpeaking && !userSpokeRecently { break }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
         guard liveState == .live else { return }
         let userTurn: [String: Any] = ["role": "user", "parts": [["text": noteText]]]
         sendJSON(["clientContent": ["turns": [userTurn], "turnComplete": true]])

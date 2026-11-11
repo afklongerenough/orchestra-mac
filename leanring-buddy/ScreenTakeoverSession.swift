@@ -28,6 +28,7 @@ final class ScreenTakeoverSession {
     private let showCursorAt: (CGPoint, CGRect) -> Void
     private let maximumStepCount = 15
     private var actionLog: [String] = []
+    private var isUsingTakeoverModel = true
     /// With the OpenCode brain, takeover uses a model that's better at finding
     /// things on screen than the everyday chat model (change with this default).
     static let takeoverModelDefaultsKey = "takeoverOpenCodeModel"
@@ -74,10 +75,11 @@ final class ScreenTakeoverSession {
             """
 
             var commandTexts: [String] = []
-            // A reply without [DO: …] tags gets one retry with a reminder
-            // before giving up, instead of stopping right away.
-            for attemptNumber in 1...2 {
-                let attemptPrompt = attemptNumber == 1
+            var previousReplyHadNoActions = false
+            // A reply without [DO: …] tags gets a retry with a reminder, and a
+            // failing takeover model falls back once, before giving up.
+            for attemptNumber in 1...3 {
+                let attemptPrompt = !previousReplyHadNoActions
                     ? stepPrompt
                     : stepPrompt + "\n\nyour last reply had no [DO: ...] tags, so nothing happened. reply again: one short note, then the actions as [DO: ...] tags. if you truly can't tell what to do, use [DO: ask ...] with a specific question."
                 let modelReply: String
@@ -86,12 +88,20 @@ final class ScreenTakeoverSession {
                         images: labeledImages,
                         systemPrompt: Self.takeoverSystemPrompt,
                         userPrompt: attemptPrompt,
-                        openCodeModelOverride: Self.takeoverOpenCodeModel,
+                        openCodeModelOverride: isUsingTakeoverModel ? Self.takeoverOpenCodeModel : nil,
                         onTextChunk: { _ in }
                     )
                     modelReply = replyText
+                } catch is CancellationError {
+                    return Outcome(finished: false, spokenSummary: "okay, stopped.")
                 } catch {
                     OrchestraLog.write("🖱️ Takeover step \(stepNumber): model error \(error.localizedDescription)")
+                    // The takeover model may be unavailable: fall back to the everyday brain once.
+                    if isUsingTakeoverModel && !Task.isCancelled {
+                        isUsingTakeoverModel = false
+                        OrchestraLog.write("🖱️ Takeover: switching to the everyday model")
+                        continue
+                    }
                     return Outcome(finished: false, spokenSummary: "i stopped, because \(error.localizedDescription).")
                 }
                 if Task.isCancelled {
@@ -100,6 +110,7 @@ final class ScreenTakeoverSession {
                 OrchestraLog.write("🖱️ Takeover step \(stepNumber) (try \(attemptNumber)): \(modelReply.prefix(400).replacingOccurrences(of: "\n", with: " "))")
                 commandTexts = Self.extractCommands(from: modelReply)
                 if !commandTexts.isEmpty { break }
+                previousReplyHadNoActions = true
             }
             if commandTexts.isEmpty {
                 return Outcome(finished: false, spokenSummary: "i couldn't work out the next step on screen. can you tell me exactly what to click or what text you mean?")
@@ -124,6 +135,7 @@ final class ScreenTakeoverSession {
                     guard dragEndpointTexts.count == 2,
                           let dragStart = Self.parsePointArgument(dragEndpointTexts[0]),
                           let dragEnd = Self.parsePointArgument(dragEndpointTexts[1]),
+                          dragStart.1 == nil || dragEnd.1 == nil || dragStart.1 == dragEnd.1,
                           let dragScreenCapture = Self.screenCapture(number: dragStart.1 ?? dragEnd.1, in: screenCaptures) else {
                         actionLog.append("- \(commandText) (skipped: write it as drag x1,y1 to x2,y2)")
                         continue
@@ -135,6 +147,10 @@ final class ScreenTakeoverSession {
                         return Outcome(finished: false, spokenSummary: "i'm leaving that drag to you, since it ends on \(irreversibleLabel).")
                     }
                     showCursorAt(dragEndAppKitPoint, dragScreenCapture.displayFrame)
+                    try? await Task.sleep(nanoseconds: 450_000_000)
+                    if Task.isCancelled {
+                        return Outcome(finished: false, spokenSummary: "okay, stopped.")
+                    }
                     ScreenControl.drag(fromAppKitGlobalPoint: dragStartAppKitPoint, toAppKitGlobalPoint: dragEndAppKitPoint)
                     actionLog.append("- \(commandText)")
                 case "click", "double_click", "triple_click", "right_click":
