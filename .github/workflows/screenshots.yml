@@ -1,0 +1,61 @@
+# Launches the latest Orchestra build on a GitHub Mac runner and takes
+# real screenshots of it (first launch, and the "already onboarded" state).
+# Run manually: gh workflow run screenshots.yml
+#
+# Note: the runner can't grant macOS privacy permissions, so these show the
+# app as it looks before Screen Recording / Accessibility / Mic are allowed.
+
+name: Orchestra screenshots
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  screenshots:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Download latest DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download -R "$GITHUB_REPOSITORY" --pattern Orchestra.dmg --dir .
+
+      - name: Install app
+        run: |
+          hdiutil attach Orchestra.dmg -nobrowse -mountpoint /tmp/orchestra-dmg
+          cp -R /tmp/orchestra-dmg/Orchestra.app /Applications/
+          hdiutil detach /tmp/orchestra-dmg
+          xattr -dr com.apple.quarantine /Applications/Orchestra.app || true
+          mkdir -p shots
+
+      - name: Screenshot first launch
+        run: |
+          open /Applications/Orchestra.app
+          sleep 12
+          screencapture -x shots/1-first-launch.png
+          osascript -e 'tell application "Orchestra" to quit' || pkill -x Orchestra || true
+          sleep 3
+
+      - name: Screenshot after onboarding
+        run: |
+          defaults write com.paulsabyss.orchestra hasCompletedOnboarding -bool true
+          open /Applications/Orchestra.app
+          sleep 12
+          screencapture -x shots/2-after-onboarding.png
+          pkill -x Orchestra || true
+
+      - name: Shrink to JPEG
+        run: |
+          cd shots
+          for f in *.png; do
+            sips -Z 1600 -s format jpeg -s formatOptions 70 "$f" --out "${f%.png}.jpg" >/dev/null
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orchestra-screenshots
+          path: shots/*.jpg

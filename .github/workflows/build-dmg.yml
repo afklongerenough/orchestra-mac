@@ -1,0 +1,90 @@
+# Builds Orchestra.app on a GitHub-hosted Mac (no Xcode needed on the user's
+# MacBook) and publishes Orchestra.dmg as a workflow artifact and as the
+# "latest" release asset.
+#
+# The app is ad-hoc signed (no Apple Developer account), so after
+# installing you may need to clear the quarantine flag once:
+#   xattr -dr com.apple.quarantine /Applications/Orchestra.app
+# and macOS will ask for Screen Recording / Accessibility / Microphone
+# again after each new build.
+
+name: Build Orchestra DMG
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build app (ad-hoc signed)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project leanring-buddy.xcodeproj \
+            -scheme leanring-buddy \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            ENABLE_HARDENED_RUNTIME=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none" \
+            build 2>&1 | tee build.log | grep -E "error:|warning: .*Orchestra|BUILD (SUCCEEDED|FAILED)|\*\* " || true
+          # xcodebuild creates the .app folder before compiling, so check the
+          # log and the real executable instead of just the folder.
+          grep -q "BUILD SUCCEEDED" build.log
+          test -x "build/Build/Products/Release/Orchestra.app/Contents/MacOS/Orchestra"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Re-sign whole bundle ad-hoc
+        run: |
+          APP="build/Build/Products/Release/Orchestra.app"
+          codesign --force --deep --sign - \
+            --entitlements leanring-buddy/leanring-buddy.entitlements "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Make DMG
+        run: |
+          mkdir -p dmg-root
+          cp -R "build/Build/Products/Release/Orchestra.app" dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "Orchestra" -srcfolder dmg-root -ov -format UDZO Orchestra.dmg
+          shasum -a 256 Orchestra.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Orchestra-dmg
+          path: Orchestra.dmg
+
+      - name: Publish as latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" Orchestra.dmg \
+            --title "Orchestra build ${GITHUB_RUN_NUMBER}" \
+            --notes "Built from ${GITHUB_SHA::7}. Ad-hoc signed: after dragging to Applications run: xattr -dr com.apple.quarantine /Applications/Orchestra.app" \
+            --latest
