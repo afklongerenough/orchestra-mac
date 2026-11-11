@@ -85,7 +85,8 @@ jobs:
           # A self-signed certificate has to be trusted for code signing on this runner.
           security find-certificate -c "$SIGNING_IDENTITY_NAME" -p "$KEYCHAIN_PATH" > "$RUNNER_TEMP/signing-cert.pem"
           sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/signing-cert.pem"
-          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH" | tee "$RUNNER_TEMP/identities.txt"
+          grep -q "$SIGNING_IDENTITY_NAME" "$RUNNER_TEMP/identities.txt" || { echo "::error::signing identity not usable"; exit 1; }
           echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Re-sign whole bundle
