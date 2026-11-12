@@ -45,20 +45,46 @@ final class WakeWordListener {
 
     // MARK: - Start / stop
 
+    #if canImport(SherpaOnnxC)
+    /// The dedicated wake-word model (bundled by CI); loaded once.
+    private var sherpaKeywordSpotter: SherpaKeywordSpotter?
+    private var hasTriedLoadingSherpaKeywordSpotter = false
+    #endif
+
+    /// True when the dedicated wake-word model is bundled and loads.
+    private func loadDedicatedWakeWordModelIfAvailable() -> Bool {
+        #if canImport(SherpaOnnxC)
+        if !hasTriedLoadingSherpaKeywordSpotter {
+            hasTriedLoadingSherpaKeywordSpotter = true
+            sherpaKeywordSpotter = SherpaKeywordSpotter()
+            OrchestraLog.write("👂 Wake word: dedicated model \(sherpaKeywordSpotter == nil ? "not available, using Apple's on-device speech" : "loaded")")
+            sherpaKeywordSpotter?.onKeywordDetected = { [weak self] in
+                Task { @MainActor [weak self] in self?.handleWakeWordHeard(description: "keyword model") }
+            }
+        }
+        return sherpaKeywordSpotter != nil
+        #else
+        return false
+        #endif
+    }
+
     func startListening() {
         guard !isListening else { return }
-        guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
-            statusText = "needs speech recognition permission"
-            SFSpeechRecognizer.requestAuthorization { _ in }
-            return
+        let usesDedicatedModel = loadDedicatedWakeWordModelIfAvailable()
+        if !usesDedicatedModel {
+            guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
+                statusText = "needs speech recognition permission"
+                SFSpeechRecognizer.requestAuthorization { _ in }
+                return
+            }
+            guard let speechRecognizer, speechRecognizer.supportsOnDeviceRecognition else {
+                // Never fall back to Apple's servers for an always-waiting mic.
+                statusText = "on-device speech isn't available on this Mac, so it stays off"
+                return
+            }
         }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
             statusText = "needs microphone permission"
-            return
-        }
-        guard let speechRecognizer, speechRecognizer.supportsOnDeviceRecognition else {
-            // Never fall back to Apple's servers for an always-waiting mic.
-            statusText = "on-device speech isn't available on this Mac, so it stays off"
             return
         }
 
@@ -69,9 +95,20 @@ final class WakeWordListener {
             statusText = "no microphone found"
             return
         }
+        #if canImport(SherpaOnnxC)
+        let dedicatedSpotter = usesDedicatedModel ? sherpaKeywordSpotter : nil
+        dedicatedSpotter?.resetStream()
+        #endif
         let loudnessGate = self.loudnessGate
         loudnessGate.reset()
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] audioBuffer, _ in
+            #if canImport(SherpaOnnxC)
+            if let dedicatedSpotter {
+                // The keyword model is cheap enough to hear everything (no gate).
+                dedicatedSpotter.acceptMicrophoneBuffer(audioBuffer)
+                return
+            }
+            #endif
             // Audio thread: only pass on sound while someone is talking.
             for gatedBuffer in loudnessGate.buffersToForward(for: audioBuffer) {
                 Task { @MainActor [weak self] in
@@ -90,12 +127,23 @@ final class WakeWordListener {
         }
         audioEngine = newAudioEngine
         isListening = true
-        statusText = "listening for \"hey clicky\" (on this Mac only)"
-        startRecognitionSession()
-        recognitionSessionTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.restartRecognitionSessionIfOld() }
+        if usesDedicatedModel {
+            statusText = "listening for \"hey clicky\" (wake-word model, on this Mac only)"
+        } else {
+            statusText = "listening for \"hey clicky\" (Apple on-device speech, on this Mac only)"
+            startRecognitionSession()
+            recognitionSessionTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.restartRecognitionSessionIfOld() }
+            }
         }
-        OrchestraLog.write("👂 Wake word: listening (on-device)")
+        OrchestraLog.write("👂 Wake word: listening (\(usesDedicatedModel ? "keyword model" : "on-device speech"))")
+    }
+
+    private func handleWakeWordHeard(description detectorDescription: String) {
+        guard isListening else { return }
+        OrchestraLog.write("👂 Wake word: heard \"hey clicky\" (\(detectorDescription))")
+        stopListening(statusAfterStopping: "heard \"hey clicky\"")
+        onWakeWordDetected?()
     }
 
     func stopListening(statusAfterStopping: String = "paused") {
@@ -130,9 +178,7 @@ final class WakeWordListener {
             Task { @MainActor [weak self] in
                 guard let self, self.isListening else { return }
                 if Self.containsWakePhrase(heardText) {
-                    OrchestraLog.write("👂 Wake word: heard \"\(heardText.suffix(40))\"")
-                    self.stopListening(statusAfterStopping: "heard \"hey clicky\"")
-                    self.onWakeWordDetected?()
+                    self.handleWakeWordHeard(description: "speech: \(heardText.suffix(40))")
                     return
                 }
                 // A finished or failed session: start a fresh one (keeps memory and work small).

@@ -32,6 +32,49 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
+      # "Hey Clicky" wake word: sherpa-onnx keyword spotting (Apache-2.0) and
+      # its small English KWS model, pinned by version + sha256. The app
+      # builds without these too (it falls back to Apple's on-device speech).
+      - name: Fetch wake-word engine and model
+        run: |
+          set -euo pipefail
+          mkdir -p ThirdParty/sherpa && cd ThirdParty/sherpa
+          curl -fsSL -o sherpa.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-osx-universal2-shared.tar.bz2
+          echo "bf6718f708e15390f1da133dd888661a68df270791b178aaf765d4e3f0baa9fe  sherpa.tar.bz2" | shasum -a 256 -c
+          tar xjf sherpa.tar.bz2
+          mv sherpa-onnx-v2.0.1-osx-universal2-shared/include include
+          mkdir -p lib
+          cp sherpa-onnx-v2.0.1-osx-universal2-shared/lib/libsherpa-onnx-c-api.dylib lib/
+          cp sherpa-onnx-v2.0.1-osx-universal2-shared/lib/libonnxruntime.dylib lib/
+          # Apple silicon only (smaller app), and load them from the app's Frameworks folder.
+          for DYLIB in lib/*.dylib; do
+            lipo "$DYLIB" -thin arm64 -output "$DYLIB.arm64" 2>/dev/null && mv "$DYLIB.arm64" "$DYLIB" || true
+            install_name_tool -id "@rpath/$(basename "$DYLIB")" "$DYLIB"
+          done
+          ONNXRUNTIME_REFERENCE=$(otool -L lib/libsherpa-onnx-c-api.dylib | awk '/libonnxruntime/ {print $1}' | head -1)
+          if [ -n "$ONNXRUNTIME_REFERENCE" ] && [ "$ONNXRUNTIME_REFERENCE" != "@rpath/libonnxruntime.dylib" ]; then
+            install_name_tool -change "$ONNXRUNTIME_REFERENCE" "@rpath/libonnxruntime.dylib" lib/libsherpa-onnx-c-api.dylib
+          fi
+          otool -L lib/libsherpa-onnx-c-api.dylib
+          cat > include/module.modulemap <<'MODULEMAP'
+          module SherpaOnnxC {
+            header "sherpa-onnx/c-api/c-api.h"
+            link "sherpa-onnx-c-api"
+            export *
+          }
+          MODULEMAP
+          curl -fsSL -o kws.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2
+          echo "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a  kws.tar.bz2" | shasum -a 256 -c
+          tar xjf kws.tar.bz2
+          MODEL_DIR=sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01
+          mkdir -p kws
+          cp $MODEL_DIR/encoder-*-left-64.int8.onnx kws/encoder.onnx
+          cp $MODEL_DIR/decoder-*-left-64.onnx kws/decoder.onnx
+          cp $MODEL_DIR/joiner-*-left-64.int8.onnx kws/joiner.onnx
+          cp $MODEL_DIR/tokens.txt kws/tokens.txt
+          ls -la kws lib
+          rm -rf sherpa.tar.bz2 kws.tar.bz2 sherpa-onnx-v2.0.1-osx-universal2-shared $MODEL_DIR
+
       - name: Build app (ad-hoc signed)
         run: |
           set -o pipefail
@@ -45,6 +88,10 @@ jobs:
             -skipMacroValidation \
             CODE_SIGN_IDENTITY="-" \
             CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            SWIFT_INCLUDE_PATHS="$PWD/ThirdParty/sherpa/include" \
+            LIBRARY_SEARCH_PATHS="$PWD/ThirdParty/sherpa/lib" \
             CODE_SIGN_STYLE=Manual \
             ENABLE_HARDENED_RUNTIME=NO \
             DEVELOPMENT_TEAM="" \
@@ -88,6 +135,14 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH" | tee "$RUNNER_TEMP/identities.txt"
           grep -q "$SIGNING_IDENTITY_NAME" "$RUNNER_TEMP/identities.txt" || { echo "::error::signing identity not usable"; exit 1; }
           echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Bundle wake-word engine and model
+        run: |
+          APP="build/Build/Products/Release/Orchestra.app"
+          mkdir -p "$APP/Contents/Frameworks" "$APP/Contents/Resources/kws"
+          cp ThirdParty/sherpa/lib/*.dylib "$APP/Contents/Frameworks/"
+          cp ThirdParty/sherpa/kws/* "$APP/Contents/Resources/kws/"
+          echo "Orchestra links:"; otool -L "$APP/Contents/MacOS/Orchestra" | grep -E "sherpa|onnx" || echo "(no sherpa link: built without the wake-word model)"
 
       - name: Re-sign whole bundle
         run: |
