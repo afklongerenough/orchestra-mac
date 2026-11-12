@@ -79,6 +79,9 @@ final class SpotifyLibrary {
         guard let nowPlaying = Self.currentlyPlayingTrack(onlyWhilePlaying: true),
               nowPlaying.uri != lastRecordedTrackURI else { return }
         lastRecordedTrackURI = nowPlaying.uri
+        if playedTracks.isEmpty {
+            OrchestraLog.write("🎵 Spotify history: started recording (first track: \(nowPlaying.name))")
+        }
         playedTracks.append(nowPlaying)
         if playedTracks.count > maximumHistoryEntryCount {
             playedTracks.removeFirst(playedTracks.count - maximumHistoryEntryCount)

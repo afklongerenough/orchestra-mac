@@ -172,7 +172,10 @@ final class MacActionRunner {
         // Spotify actually started so the reply never names the wrong song.
         if let bestMatch = await findBestSpotifyMatch(for: whatToPlay) {
             let playResult = playSpotifyURI(bestMatch.uri, description: description)
-            guard playResult.succeeded else { return playResult }
+            guard playResult.succeeded else {
+                OrchestraLog.write("🎵 Spotify: play failed: \(playResult.detail ?? "unknown")")
+                return playResult
+            }
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             let nowPlaying = SpotifyLibrary.currentlyPlayingTrack(onlyWhilePlaying: false)
             let playingName = nowPlaying?.name ?? bestMatch.name
@@ -225,7 +228,10 @@ final class MacActionRunner {
     /// user's listening history (so "stay high" finds the one they play).
     /// Playlists/albums: the first result.
     private func findBestSpotifyMatch(for query: String) async -> SpotifyMatch? {
-        guard let accessToken = await spotifyAccessToken() else { return nil }
+        guard let accessToken = await spotifyAccessToken() else {
+            OrchestraLog.write("🎵 Spotify: no Web API token (client id/secret missing or rejected), opening search instead")
+            return nil
+        }
 
         let lowercasedQuery = query.lowercased()
         let preferredType: String
@@ -262,6 +268,7 @@ final class MacActionRunner {
             searchItems = await spotifySearchItems(searchText: cleanedQuery.isEmpty ? query : cleanedQuery, type: preferredType,
                                                    limit: preferredType == "track" ? 20 : 1, accessToken: accessToken)
         }
+        OrchestraLog.write("🎵 Spotify: \"\(searchText)\" → \(searchItems.count) results")
         guard !searchItems.isEmpty else { return nil }
 
         guard preferredType == "track" else {
@@ -276,6 +283,7 @@ final class MacActionRunner {
         guard let ranked = await SpotifyLibrary.shared.bestCandidate(from: candidates, requestedTitle: requestedTitle, requestedArtist: requestedArtist) else {
             return nil
         }
+        OrchestraLog.write("🎵 Spotify: picked \(ranked.candidate.name) by \(ranked.candidate.artistNames.joined(separator: ", ")) (title match: \(ranked.isTitleMatch))")
         return SpotifyMatch(uri: ranked.candidate.uri, name: ranked.candidate.name,
                             artistText: ranked.candidate.artistNames.joined(separator: ", "), isTitleMatch: ranked.isTitleMatch)
     }
@@ -315,8 +323,15 @@ final class MacActionRunner {
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         request.httpBody = Data("grant_type=client_credentials".utf8)
 
-        guard let tokenResponse = try? await session.data(for: request),
-              (tokenResponse.1 as? HTTPURLResponse)?.statusCode == 200,
+        guard let tokenResponse = try? await session.data(for: request) else {
+            OrchestraLog.write("🎵 Spotify: token request didn't reach Spotify")
+            return nil
+        }
+        let tokenStatusCode = (tokenResponse.1 as? HTTPURLResponse)?.statusCode ?? 0
+        if tokenStatusCode != 200 {
+            OrchestraLog.write("🎵 Spotify: token request refused (HTTP \(tokenStatusCode)); check the client id and secret")
+        }
+        guard tokenStatusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: tokenResponse.0) as? [String: Any],
               let accessToken = json["access_token"] as? String else {
             return nil
