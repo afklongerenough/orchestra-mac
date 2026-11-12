@@ -33,8 +33,10 @@ enum KeychainStore {
     private static let secretsLock = NSLock()
     /// Loaded once from disk, then kept in memory (guarded by secretsLock).
     private static var cachedSecrets: [String: String]?
-    /// Keys already looked up in the old Keychain this launch (so a "Deny" isn't asked again).
+    /// Keys whose old Keychain item was found (and moved) or doesn't exist.
     private static var legacyKeychainLookupsTried = Set<String>()
+    /// After a dismissed/denied password prompt, wait before asking again.
+    private static var legacyKeychainRetryAfterDateByKey: [String: Date] = [:]
 
     private static var secretsFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -50,17 +52,33 @@ enum KeychainStore {
             return savedValue
         }
         let shouldTryLegacyKeychain = !legacyKeychainLookupsTried.contains(key.rawValue)
-        legacyKeychainLookupsTried.insert(key.rawValue)
+            && Date() >= (legacyKeychainRetryAfterDateByKey[key.rawValue] ?? .distantPast)
         secretsLock.unlock()
+        guard shouldTryLegacyKeychain else { return nil }
 
         // One-time move from the old Keychain item (may show one last password prompt).
-        guard shouldTryLegacyKeychain, let legacyValue = readLegacyKeychainItem(key) else { return nil }
+        let (legacyLookupStatus, legacyValue) = readLegacyKeychainItem(key)
         secretsLock.lock()
-        secrets = loadSecretsLocked()
-        secrets[key.rawValue] = legacyValue
-        saveSecretsLocked(secrets)
-        secretsLock.unlock()
-        return legacyValue
+        defer { secretsLock.unlock() }
+        switch legacyLookupStatus {
+        case errSecSuccess:
+            legacyKeychainLookupsTried.insert(key.rawValue)
+            guard let legacyValue else { return nil }
+            secrets = loadSecretsLocked()
+            // A key typed in while the prompt was up wins over the old one.
+            if let newerValue = secrets[key.rawValue], !newerValue.isEmpty { return newerValue }
+            secrets[key.rawValue] = legacyValue
+            saveSecretsLocked(secrets)
+            return legacyValue
+        case errSecItemNotFound:
+            legacyKeychainLookupsTried.insert(key.rawValue)
+            return nil
+        default:
+            // Prompt dismissed or denied: try again in 10 minutes, not on every read.
+            legacyKeychainRetryAfterDateByKey[key.rawValue] = Date().addingTimeInterval(600)
+            OrchestraLog.write("🔑 Couldn't read the saved \(key.rawValue) from the Keychain (status \(legacyLookupStatus)); will ask again later, or paste it again under Connections")
+            return nil
+        }
     }
 
     @discardableResult
@@ -94,9 +112,16 @@ enum KeychainStore {
     private static func loadSecretsLocked() -> [String: String] {
         if let cachedSecrets { return cachedSecrets }
         var loadedSecrets: [String: String] = [:]
-        if let secretsData = try? Data(contentsOf: secretsFileURL),
-           let decodedSecrets = try? JSONDecoder().decode([String: String].self, from: secretsData) {
-            loadedSecrets = decodedSecrets
+        if let secretsData = try? Data(contentsOf: secretsFileURL) {
+            if let decodedSecrets = try? JSONDecoder().decode([String: String].self, from: secretsData) {
+                loadedSecrets = decodedSecrets
+            } else {
+                // Never overwrite an unreadable file: set it aside so nothing is lost.
+                let backupFileURL = secretsFileURL.deletingLastPathComponent()
+                    .appendingPathComponent("secrets-unreadable-\(Int(Date().timeIntervalSince1970)).json")
+                try? FileManager.default.moveItem(at: secretsFileURL, to: backupFileURL)
+                print("⚠️ secrets.json couldn't be read; moved it to \(backupFileURL.lastPathComponent)")
+            }
         }
         cachedSecrets = loadedSecrets
         return loadedSecrets
@@ -104,15 +129,15 @@ enum KeychainStore {
 
     @discardableResult
     private static func saveSecretsLocked(_ secrets: [String: String]) -> Bool {
-        cachedSecrets = secrets
         let folderURL = secretsFileURL.deletingLastPathComponent()
+        let temporaryFileURL = folderURL.appendingPathComponent(".secrets-\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: temporaryFileURL) }
         do {
             try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: folderURL.path)
             let secretsData = try JSONEncoder().encode(secrets)
             // Write to a private temp file first, then move it in (never world-readable, never half-written).
-            let temporaryFileURL = folderURL.appendingPathComponent(".secrets-\(UUID().uuidString).tmp")
             guard FileManager.default.createFile(atPath: temporaryFileURL.path, contents: secretsData,
                                                  attributes: [.posixPermissions: 0o600]) else { return false }
             if FileManager.default.fileExists(atPath: secretsFileURL.path) {
@@ -121,6 +146,8 @@ enum KeychainStore {
                 try FileManager.default.moveItem(at: temporaryFileURL, to: secretsFileURL)
             }
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretsFileURL.path)
+            // Only remember what really reached the disk.
+            cachedSecrets = secrets
             return true
         } catch {
             print("⚠️ Couldn't save secrets: \(error.localizedDescription)")
@@ -130,7 +157,7 @@ enum KeychainStore {
 
     // MARK: - Old Keychain items (read once to migrate)
 
-    private static func readLegacyKeychainItem(_ key: Key) -> String? {
+    private static func readLegacyKeychainItem(_ key: Key) -> (status: OSStatus, value: String?) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: legacyKeychainService,
@@ -139,13 +166,14 @@ enum KeychainStore {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+        let lookupStatus = SecItemCopyMatching(query as CFDictionary, &item)
+        guard lookupStatus == errSecSuccess,
               let data = item as? Data,
               let value = String(data: data, encoding: .utf8) else {
-            return nil
+            return (lookupStatus, nil)
         }
         let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedValue.isEmpty ? nil : trimmedValue
+        return (lookupStatus, trimmedValue.isEmpty ? nil : trimmedValue)
     }
 
     private static func deleteLegacyKeychainItem(_ key: Key) {
