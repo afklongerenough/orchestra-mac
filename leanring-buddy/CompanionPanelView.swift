@@ -52,6 +52,8 @@ struct CompanionPanelView: View {
 
                 liveModeToggleRow
                     .padding(.horizontal, 16)
+                wakeWordToggleRow
+                    .padding(.horizontal, 16)
 
                 voicePickerRow
                     .padding(.horizontal, 16)
@@ -786,6 +788,34 @@ struct CompanionPanelView: View {
             Toggle("", isOn: Binding(
                 get: { companionManager.isLiveModeEnabled },
                 set: { companionManager.setLiveModeEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .controlSize(.small)
+            .pointerCursor()
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Wake word
+
+    private var wakeWordToggleRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\"Hey Clicky\"")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text(companionManager.isWakeWordEnabled
+                     ? "Say it to start a live chat. Heard on this Mac only, nothing is recorded. Status: \(companionManager.wakeWordStatusText)"
+                     : "Off: say \"hey clicky\" to start a live chat, hands-free")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { companionManager.isWakeWordEnabled },
+                set: { companionManager.setWakeWordEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

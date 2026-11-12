@@ -242,6 +242,7 @@ final class CompanionManager: ObservableObject {
         refreshAllPermissions()
         OrchestraUpdater.shared.startPeriodicChecks()
         SpotifyLibrary.shared.startRecordingLocalHistory()
+        startWakeWordReconciling()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
@@ -593,6 +594,8 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
+            // The hotkey takes the mic: stop waiting for "hey clicky" right away.
+            if wakeWordListener.isListening { wakeWordListener.stopListening() }
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
 
@@ -1069,6 +1072,78 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var isLiveSessionActive: Bool = false
     private var geminiLiveSession: GeminiLiveSession?
 
+    // MARK: - "Hey Clicky" wake word
+
+    @Published private(set) var isWakeWordEnabled: Bool = UserDefaults.standard.bool(forKey: "isWakeWordEnabled")
+    @Published private(set) var wakeWordStatusText: String = "off"
+    private let wakeWordListener = WakeWordListener()
+    private var wakeWordReconcileTimer: Timer?
+    /// A failed start (no permission…) isn't retried every second.
+    private var wakeWordNextStartAttemptDate = Date.distantPast
+    /// Live sessions opened by the wake word close themselves after a quiet spell.
+    private var isLiveSessionStartedByWakeWord = false
+    private static let wakeWordConversationIdleSeconds: TimeInterval = 45
+
+    func setWakeWordEnabled(_ enabled: Bool) {
+        isWakeWordEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isWakeWordEnabled")
+        wakeWordNextStartAttemptDate = .distantPast
+        reconcileWakeWordListening()
+    }
+
+    private func startWakeWordReconciling() {
+        wakeWordListener.onWakeWordDetected = { [weak self] in
+            self?.startLiveConversationFromWakeWord()
+        }
+        wakeWordReconcileTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.reconcileWakeWordListening() }
+        }
+        reconcileWakeWordListening()
+    }
+
+    /// Listens for "hey clicky" only when nothing else is using the mic or talking.
+    private func reconcileWakeWordListening() {
+        // Close wake-word conversations that have gone quiet (like Siri does).
+        if isLiveSessionActive, isLiveSessionStartedByWakeWord, !isScreenTakeoverRunning,
+           let geminiLiveSession,
+           geminiLiveSession.secondsSinceLastConversationActivity > Self.wakeWordConversationIdleSeconds {
+            OrchestraLog.write("👂 Wake word: conversation went quiet, closing it")
+            geminiLiveSession.stop()
+        }
+
+        let isLiveConnectingOrOn = isLiveSessionActive
+            || geminiLiveSession?.liveState == .connecting || geminiLiveSession?.liveState == .live
+        let shouldListen = isWakeWordEnabled && hasCompletedOnboarding
+            && !isLiveConnectingOrOn
+            && !buddyDictationManager.isDictationInProgress
+            && voiceState != .listening && voiceState != .processing
+            && !speechOutputClient.isPlaying
+        if !isLiveConnectingOrOn { isLiveSessionStartedByWakeWord = false }
+
+        if shouldListen && !wakeWordListener.isListening && Date() >= wakeWordNextStartAttemptDate {
+            wakeWordListener.startListening()
+            if !wakeWordListener.isListening {
+                wakeWordNextStartAttemptDate = Date().addingTimeInterval(30)
+            }
+        } else if !shouldListen && wakeWordListener.isListening {
+            wakeWordListener.stopListening()
+        }
+        let newStatusText = isWakeWordEnabled ? wakeWordListener.statusText : "off"
+        if wakeWordStatusText != newStatusText { wakeWordStatusText = newStatusText }
+    }
+
+    private func startLiveConversationFromWakeWord() {
+        guard !isLiveSessionActive else { return }
+        NSSound(named: "Pop")?.play()
+        isLiveSessionStartedByWakeWord = true
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+        toggleLiveSession()
+    }
+
     func setLiveModeEnabled(_ enabled: Bool) {
         isLiveModeEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "isLiveModeEnabled")
@@ -1184,6 +1259,14 @@ final class CompanionManager: ObservableObject {
             },
             recentJobsSummary: { [weak self] in
                 self?.orchestraJobManager.recentJobsSummaryForPrompt() ?? "no jobs"
+            },
+            endConversation: { [weak self] in
+                // Close after the goodbye has been said (the tool reply goes out first).
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 3_500_000_000)
+                    self?.geminiLiveSession?.stop()
+                }
+                return "closing after your goodbye"
             }
         )
 
@@ -1224,6 +1307,7 @@ final class CompanionManager: ObservableObject {
     - take_over_screen: anything that needs clicking or selecting on screen (e.g. "copy this paragraph", "write this into that box", "fill this in"). it runs in the background while you stay in the conversation. write a goal that stands on its own: what to do, and the exact visible text or element you mean (resolve "this"/"that" from the screen and the conversation).
     - show_me_how: when the user wants to learn to do it themselves ("show me how", "teach me", "walk me through"). a guide points at each step and you'll be asked to say each step; they do the clicking.
     - stop_screen_takeover: when the user says stop or wait during a takeover or a walkthrough.
+    - end_conversation: when the user says bye, that's all, or stop listening. say a short bye, then call it.
     - browser: when a web browser is in front — read the page (titles, buttons, fields and text, with ids), click or type by id, open an address, scroll, go back. more accurate than pointing for web pages; use read first to get ids.
     - start_job: real work in the background. place "hermes" for research, the web, and their accounts (email, calendar, files, notes, reminders, github). place "mac" for their mac's files and apps. the brief must stand on its own.
     - add_routine: when the user wants something on a schedule.

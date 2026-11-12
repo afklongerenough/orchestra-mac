@@ -42,6 +42,7 @@ final class GeminiLiveSession: NSObject {
         let stopTakeover: () -> String
         let addRoutine: (_ schedule: String, _ place: OrchestraJobPlace, _ brief: String) -> String
         let recentJobsSummary: () -> String
+        let endConversation: () -> String
     }
 
     static let defaultLiveModel = "gemini-3.8-live"
@@ -88,6 +89,13 @@ final class GeminiLiveSession: NSObject {
     /// decide whether "only when asked" allows a look at the screen.
     private var recentUserSpeechText = ""
     private var lastUserSpeechDate = Date.distantPast
+    private var sessionStartDate = Date()
+
+    /// Seconds since anyone last spoke (user or Orchestra), for ending idle conversations.
+    var secondsSinceLastConversationActivity: TimeInterval {
+        let lastActivityDate = max(sessionStartDate, lastUserSpeechDate, modelSpeechPlaysUntil)
+        return Date().timeIntervalSince(lastActivityDate)
+    }
     private let microphoneTargetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
     private let playbackFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false)!
     private var screenFrameTask: Task<Void, Never>?
@@ -116,6 +124,7 @@ final class GeminiLiveSession: NSObject {
         guard let webSocketURL = urlComponents.url else { return }
 
         liveState = .connecting
+        sessionStartDate = Date()
         isSetupComplete = false
         let newWebSocketTask = urlSession.webSocketTask(with: webSocketURL)
         webSocketTask = newWebSocketTask
@@ -249,6 +258,11 @@ final class GeminiLiveSession: NSObject {
         [
             "name": "look_at_screen",
             "description": "Take one fresh look at the user's screen (use when the user asks you to look, or you need to see it). The image arrives right after this call.",
+            "parameters": stringParameters([], required: [])
+        ],
+        [
+            "name": "end_conversation",
+            "description": "End this live conversation (close the mic) when the user says goodbye, that's all, thanks that's it, or stop listening. Say a short bye first.",
             "parameters": stringParameters([], required: [])
         ],
         [
@@ -407,6 +421,8 @@ final class GeminiLiveSession: NSObject {
             }
             guard await sendOneScreenFrame(announceCapture: true) else { return "couldn't capture the screen" }
             return "sent a fresh screenshot of the screen where the user's cursor is"
+        case "end_conversation":
+            return toolHandlers.endConversation()
         case "recent_jobs":
             return toolHandlers.recentJobsSummary()
         default:
