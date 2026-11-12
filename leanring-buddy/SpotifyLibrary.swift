@@ -146,7 +146,7 @@ final class SpotifyLibrary {
         }
 
         var bestScoredCandidate: (candidate: SpotifyTrackCandidate, score: Double, isTitleMatch: Bool)?
-        for candidate in candidates {
+        for (searchRank, candidate) in candidates.enumerated() {
             let normalizedCandidateTitle = Self.normalizedSongTitle(candidate.name)
             let isExactTitle = normalizedCandidateTitle == normalizedRequestedTitle
             let isPartialTitle = !isExactTitle && !normalizedRequestedTitle.isEmpty
@@ -170,6 +170,9 @@ final class SpotifyLibrary {
             }
             let artistPlayCount = normalizedCandidateArtists.map { playCountByArtist[$0] ?? 0 }.max() ?? 0
             score += min(35, Double(artistPlayCount) * 1.5)
+            // Spotify's own order (best match first) breaks ties; popularity
+            // is no longer sent for Development Mode apps, so it's usually 0.
+            score += Double(max(0, 20 - searchRank)) * 0.5
             score += Double(candidate.popularity) / 10
 
             if bestScoredCandidate == nil || score > bestScoredCandidate!.score {

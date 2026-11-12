@@ -262,11 +262,11 @@ final class MacActionRunner {
         }
 
         var searchItems = await spotifySearchItems(searchText: searchText, type: preferredType,
-                                                  limit: preferredType == "track" ? 20 : 1, accessToken: accessToken)
+                                                  limit: preferredType == "track" ? 10 : 1, accessToken: accessToken)
         // A strict field search can miss (odd spellings): retry as plain words.
         if searchItems.isEmpty && searchText != cleanedQuery {
             searchItems = await spotifySearchItems(searchText: cleanedQuery.isEmpty ? query : cleanedQuery, type: preferredType,
-                                                   limit: preferredType == "track" ? 20 : 1, accessToken: accessToken)
+                                                   limit: preferredType == "track" ? 10 : 1, accessToken: accessToken)
         }
         OrchestraLog.write("🎵 Spotify: \"\(searchText)\" → \(searchItems.count) results")
         guard !searchItems.isEmpty else { return nil }
@@ -288,24 +288,41 @@ final class MacActionRunner {
                             artistText: ranked.candidate.artistNames.joined(separator: ", "), isTitleMatch: ranked.isTitleMatch)
     }
 
+    /// Spotify's search allows at most 10 results per request (since Feb 2026,
+    /// for apps in Development Mode); for tracks we fetch two pages.
     private func spotifySearchItems(searchText: String, type searchType: String, limit: Int, accessToken: String) async -> [[String: Any]] {
-        var components = URLComponents(string: "https://api.spotify.com/v1/search")!
-        components.queryItems = [
-            URLQueryItem(name: "q", value: searchText),
-            URLQueryItem(name: "type", value: searchType),
-            URLQueryItem(name: "limit", value: String(limit))
-        ]
-        guard let searchURL = components.url else { return [] }
-        var request = URLRequest(url: searchURL)
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        guard let searchResponse = try? await session.data(for: request),
-              (searchResponse.1 as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: searchResponse.0) as? [String: Any],
-              let section = json["\(searchType)s"] as? [String: Any],
-              let items = section["items"] as? [Any] else {
-            return []
+        let pageOffsets = searchType == "track" ? [0, 10] : [0]
+        var allItems: [[String: Any]] = []
+        for pageOffset in pageOffsets {
+            var components = URLComponents(string: "https://api.spotify.com/v1/search")!
+            components.queryItems = [
+                URLQueryItem(name: "q", value: searchText),
+                URLQueryItem(name: "type", value: searchType),
+                URLQueryItem(name: "limit", value: String(min(limit, 10))),
+                URLQueryItem(name: "offset", value: String(pageOffset))
+            ]
+            guard let searchURL = components.url else { break }
+            var request = URLRequest(url: searchURL)
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            guard let searchResponse = try? await session.data(for: request) else {
+                OrchestraLog.write("🎵 Spotify: search request didn't reach Spotify")
+                break
+            }
+            let searchStatusCode = (searchResponse.1 as? HTTPURLResponse)?.statusCode ?? 0
+            guard searchStatusCode == 200 else {
+                let errorText = String(data: searchResponse.0, encoding: .utf8)?.prefix(200) ?? ""
+                OrchestraLog.write("🎵 Spotify: search refused (HTTP \(searchStatusCode)): \(errorText)")
+                break
+            }
+            guard let json = try? JSONSerialization.jsonObject(with: searchResponse.0) as? [String: Any],
+                  let section = json["\(searchType)s"] as? [String: Any],
+                  let items = section["items"] as? [Any] else { break }
+            let pageItems = items.compactMap { $0 as? [String: Any] }
+            allItems.append(contentsOf: pageItems)
+            // A short page means there's nothing more to fetch.
+            if pageItems.count < min(limit, 10) { break }
         }
-        return items.compactMap { $0 as? [String: Any] }
+        return allItems
     }
 
     private func spotifyAccessToken() async -> String? {
