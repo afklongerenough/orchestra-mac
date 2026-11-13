@@ -47,7 +47,11 @@ final class SherpaKeywordSpotter: @unchecked Sendable {
         }
 
         // C strings must stay alive until the spotter is created (it copies them).
-        let cStrings = [encoderPath, decoderPath, joinerPath, tokensPath, "cpu", "bpe", Self.keywordsText].map { strdup($0) }
+        // withCString hands Swift a pointer that is only valid inside the closure, but strdup copies
+        // the bytes immediately, so the strdup'd copy outlives it. Calling strdup($0) directly on a
+        // String relied on implicit C bridging that does not apply here, which broke the build.
+        let cStrings: [UnsafeMutablePointer<CChar>?] = [encoderPath, decoderPath, joinerPath, tokensPath, "cpu", "bpe", Self.keywordsText]
+            .map { swiftString in swiftString.withCString { strdup($0) } }
         defer { cStrings.forEach { free($0) } }
 
         var config = SherpaOnnxKeywordSpotterConfig()
