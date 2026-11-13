@@ -52,8 +52,9 @@ final class OrchestraUpdater: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // Don't interrupt an install or hide an update that's already waiting.
+                // An "update to build N" offer is refreshed too, so it never points at an old build.
                 switch self.updateState {
-                case .installing, .available, .checking: return
+                case .installing, .checking: return
                 default: break
                 }
                 await self.checkForUpdates()
@@ -96,6 +97,8 @@ final class OrchestraUpdater: ObservableObject {
     // MARK: - Install
 
     func installAvailableUpdate() async {
+        // Ask GitHub again first: a newer build may have come out since the last check.
+        await checkForUpdates()
         guard case .available = updateState, let latestDMGDownloadURL else { return }
         do {
             try await downloadVerifyAndInstall(from: latestDMGDownloadURL)
