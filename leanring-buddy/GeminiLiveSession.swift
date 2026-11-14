@@ -67,6 +67,9 @@ final class GeminiLiveSession: NSObject {
     /// (removeTap/play on the wrong state raise exceptions Swift can't catch).
     private var isMicrophoneTapInstalled = false
     private var isPlayerNodeAttached = false
+    /// Voice processing (echo cancellation) is what lowers other apps' volume;
+    /// it must be switched off when Live ends or the music stays quiet.
+    private var isVoiceProcessingOn = false
     private var audioConfigurationObserver: NSObjectProtocol?
     /// Guards against a restart loop: starting the engine can itself post a
     /// configuration change, so ignore changes while (and just after) rebuilding.
@@ -548,6 +551,11 @@ final class GeminiLiveSession: NSObject {
         let inputNode = audioEngine.inputNode
         if useVoiceProcessing {
             try inputNode.setVoiceProcessingEnabled(true)
+            isVoiceProcessingOn = true
+            // Echo cancellation turns other apps' sound down. Keep that gentle and
+            // only while someone is actually talking, so music stays loud.
+            inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: true, duckingLevel: .min)
         }
 
         audioEngine.attach(playerNode)
@@ -651,6 +659,14 @@ final class GeminiLiveSession: NSObject {
             audioEngine.detach(playerNode)
             isPlayerNodeAttached = false
         }
+        if isVoiceProcessingOn {
+            try? audioEngine.inputNode.setVoiceProcessingEnabled(false)
+            isVoiceProcessingOn = false
+        }
+        // Drop the old engine entirely so nothing keeps the audio system in
+        // "call mode" (which keeps other sound turned down) after Live ends.
+        audioEngine = AVAudioEngine()
+        playerNode = AVAudioPlayerNode()
     }
 
     /// 24 kHz 16-bit PCM from Gemini → Float32 buffer → player.
