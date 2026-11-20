@@ -21,6 +21,7 @@ struct CompanionPanelView: View {
     @State private var spotifyAccountStatusText: String = ""
     @ObservedObject private var connectorManager = MCPConnectorManager.shared
     @ObservedObject private var agentStore = OrchestraAgentStore.shared
+    @ObservedObject private var browserExtensionBridge = BrowserExtensionBridge.shared
     @State private var newConnectorNameInput: String = ""
     @State private var newConnectorURLInput: String = ""
     @State private var newConnectorTokenInput: String = ""
@@ -1002,6 +1003,7 @@ struct CompanionPanelView: View {
                 )
                 connectionTextField(placeholder: "Spotify client secret (optional)", text: $spotifyClientSecretInput, isSecure: true)
                 spotifyAccountRow
+                chromeExtensionRow
                 connectorsSection
 
                 Button(action: {
@@ -1224,6 +1226,32 @@ struct CompanionPanelView: View {
             }
             if !spotifyAccountStatusText.isEmpty {
                 Text(spotifyAccountStatusText)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// The Orchestra Chrome extension: faster, more reliable page control,
+    /// tabs and file uploads (instead of Apple Events JavaScript).
+    private var chromeExtensionRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Chrome extension: \(browserExtensionBridge.isExtensionConnected ? "connected" : "off")")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Spacer()
+                Button(browserExtensionBridge.isExtensionConnected ? "Reinstall" : "Set up") {
+                    browserExtensionBridge.setUpExtension()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.accent)
+                .pointerCursor()
+            }
+            if !browserExtensionBridge.isExtensionConnected && browserExtensionBridge.statusText != "not set up" {
+                Text(browserExtensionBridge.statusText)
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)

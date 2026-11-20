@@ -39,7 +39,7 @@ final class GeminiLiveSession: NSObject {
         let createAgent: (_ name: String, _ purpose: String, _ place: OrchestraJobPlace) -> String
         let takeOverScreen: (_ goal: String) -> String
         let showMeHow: (_ goal: String) -> String
-        let runBrowserAction: (_ action: String, _ elementIdentifier: Int?, _ text: String) -> String
+        let runBrowserAction: (_ action: String, _ elementIdentifier: Int?, _ text: String) async -> String
         let stopTakeover: () -> String
         let addRoutine: (_ schedule: String, _ place: OrchestraJobPlace, _ brief: String) -> String
         let recentJobsSummary: () -> String
@@ -250,7 +250,7 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "browser",
-            "description": "Work inside the web page in the front browser (Chrome, Brave, Edge, Arc, Safari). action: 'read' (title, address, buttons/links/fields with ids, page text) | 'click' (needs id) | 'type' (needs id and text; replaces the field's text) | 'open' (text = https address) | 'scroll' (text = screens, negative = up) | 'back'. Read first to get ids; ids change on every read. Never for send/buy/delete buttons.",
+            "description": "Work inside the web page in the front browser (Chrome, Brave, Edge, Arc, Safari). action: 'read' (title, address, buttons/links/fields with ids, page text) | 'click' (needs id) | 'type' (needs id and text; replaces the field's text) | 'open' (text = https address) | 'scroll' (text = screens, negative = up) | 'back'. With the Orchestra Chrome extension also: 'tabs' (lists open tabs with ids) | 'switch_tab' (id = tab id) | 'upload' (id = file picker id from read, text = full path of a file the user named, in Desktop/Documents/Downloads/Pictures/Movies/Music/~/Orchestra). Read first to get ids; ids change on every read. Never for send/buy/delete buttons.",
             "parameters": [
                 "type": "object",
                 "properties": [
@@ -458,7 +458,7 @@ final class GeminiLiveSession: NSObject {
             }
             let elementIdentifier = (arguments["id"] as? Int) ?? (arguments["id"] as? Double).map { Int($0) }
                 ?? (arguments["id"] as? String).flatMap { Int($0) }
-            return toolHandlers.runBrowserAction(arguments["action"] as? String ?? "read",
+            return await toolHandlers.runBrowserAction(arguments["action"] as? String ?? "read",
                                                  elementIdentifier,
                                                  arguments["text"] as? String ?? "")
         case "add_routine":

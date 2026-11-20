@@ -64,7 +64,7 @@ enum BrowserControl {
 
     /// Title, address, the visible buttons/links/fields (with ids for click/type),
     /// and the start of the page text. Ids are fresh on every read.
-    static func readPage(maximumTextCharacters: Int = 3500) throws -> String {
+    private static func readPageUsingAppleEvents(maximumTextCharacters: Int) throws -> String {
         let javaScript = """
         (function () {
           document.querySelectorAll('[data-orch-id]').forEach(function (node) { node.removeAttribute('data-orch-id'); });
@@ -96,11 +96,108 @@ enum BrowserControl {
         return try runJavaScriptInFrontTab(javaScript)
     }
 
-    // MARK: - Actions
+    // MARK: - Public actions (the Chrome extension when it's connected, else Apple Events)
 
-    /// Clicks the element with this id (from the last readPage). Refuses Send/Buy/Delete-style controls.
-    static func clickElement(id elementIdentifier: Int) throws -> String {
-        let elementLabel = try describeElement(id: elementIdentifier)
+    /// The extension works in Chrome-family browsers; use it when one is in front.
+    private static var usableExtensionBridge: BrowserExtensionBridge? {
+        let extensionBridge = BrowserExtensionBridge.shared
+        guard extensionBridge.isExtensionConnected,
+              let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              supportedBrowsers[bundleIdentifier]?.family == .chromium else { return nil }
+        return extensionBridge
+    }
+
+    static func readPage(maximumTextCharacters: Int = 3500) async throws -> String {
+        if let extensionBridge = usableExtensionBridge {
+            return try await extensionBridge.send(["action": "read", "maxText": maximumTextCharacters])
+        }
+        return try readPageUsingAppleEvents(maximumTextCharacters: maximumTextCharacters)
+    }
+
+    /// Clicks an element by id. Refuses Send/Buy/Delete-style and unlabelled controls.
+    static func clickElement(id elementIdentifier: Int) async throws -> String {
+        guard let extensionBridge = usableExtensionBridge else {
+            return try clickElementUsingAppleEvents(id: elementIdentifier)
+        }
+        let elementLabel = try await extensionBridge.send(["action": "describe", "elementId": elementIdentifier])
+        guard !elementLabel.isEmpty else { throw BrowserError(message: "element \(elementIdentifier) is gone; read the page again") }
+        try checkClickIsAllowed(elementLabel: elementLabel, elementIdentifier: elementIdentifier)
+        let clickResult = try await extensionBridge.send(["action": "click", "elementId": elementIdentifier])
+        guard clickResult == "clicked" else { throw BrowserError(message: "element \(elementIdentifier) is gone; read the page again") }
+        return "clicked \"\(elementLabel.prefix(100))\""
+    }
+
+    static func typeIntoElement(id elementIdentifier: Int, text textToType: String) async throws -> String {
+        guard let extensionBridge = usableExtensionBridge else {
+            return try typeIntoElementUsingAppleEvents(id: elementIdentifier, text: textToType)
+        }
+        guard !textToType.isEmpty else { throw BrowserError(message: "nothing to type") }
+        let typeResult = try await extensionBridge.send(["action": "type", "elementId": elementIdentifier, "text": textToType])
+        switch typeResult {
+        case "typed": return "typed into element \(elementIdentifier)"
+        case "password": throw BrowserError(message: "that's a password field; the user types passwords themselves")
+        case "unsupported": throw BrowserError(message: "element \(elementIdentifier) isn't a text field (a dropdown, checkbox or button?); click it instead")
+        default: throw BrowserError(message: "element \(elementIdentifier) is gone; read the page again")
+        }
+    }
+
+    static func scrollPage(screens screenCount: Double) async throws -> String {
+        if let extensionBridge = usableExtensionBridge {
+            return try await extensionBridge.send(["action": "scroll", "screens": screenCount])
+        }
+        return try scrollPageUsingAppleEvents(screens: screenCount)
+    }
+
+    static func goBack() async throws -> String {
+        if let extensionBridge = usableExtensionBridge {
+            return try await extensionBridge.send(["action": "back"])
+        }
+        return try goBackUsingAppleEvents()
+    }
+
+    static func openAddress(_ addressText: String) async throws -> String {
+        if let extensionBridge = usableExtensionBridge {
+            let address = try validatedWebAddress(addressText)
+            return try await extensionBridge.send(["action": "open", "url": address.absoluteString])
+        }
+        return try openAddressUsingAppleEvents(addressText)
+    }
+
+    /// Lists the open tabs (extension only).
+    static func listTabs() async throws -> String {
+        guard let extensionBridge = usableExtensionBridge else {
+            throw BrowserError(message: "listing tabs needs the Orchestra Chrome extension (set it up in the menu)")
+        }
+        return try await extensionBridge.send(["action": "tabs"])
+    }
+
+    static func switchToTab(tabIdentifier: Int) async throws -> String {
+        guard let extensionBridge = usableExtensionBridge else {
+            throw BrowserError(message: "switching tabs needs the Orchestra Chrome extension (set it up in the menu)")
+        }
+        return try await extensionBridge.send(["action": "switch_tab", "tabId": tabIdentifier])
+    }
+
+    /// Attaches a file from the user's own folders to an upload field (extension only).
+    static func uploadFile(toElement elementIdentifier: Int, filePath: String) async throws -> String {
+        guard let extensionBridge = usableExtensionBridge else {
+            throw BrowserError(message: "uploading files needs the Orchestra Chrome extension (set it up in the menu)")
+        }
+        let expandedPath = (filePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+        let resolvedPath = URL(fileURLWithPath: expandedPath).standardizedFileURL.resolvingSymlinksInPath().path
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+        let allowedFolderPaths = ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Orchestra"]
+            .map { homePath + "/" + $0 + "/" }
+        guard allowedFolderPaths.contains(where: { resolvedPath.hasPrefix($0) }) else {
+            throw BrowserError(message: "only files in Desktop, Documents, Downloads, Pictures, Movies, Music or ~/Orchestra can be uploaded")
+        }
+        guard FileManager.default.fileExists(atPath: resolvedPath) else { throw BrowserError(message: "there's no file at \(resolvedPath)") }
+        return try await extensionBridge.send(["action": "upload", "elementId": elementIdentifier, "path": resolvedPath])
+    }
+
+    // MARK: - Safety gate (shared)
+
+    private static func checkClickIsAllowed(elementLabel: String, elementIdentifier: Int) throws {
         // An unlabelled control could be an icon-only Send or Delete: don't guess.
         // Fewer than three letters (an icon like "➤") says nothing about what it does.
         let letterCount = elementLabel.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
@@ -108,8 +205,24 @@ enum BrowserControl {
             throw BrowserError(message: "element \(elementIdentifier) has no label, so i can't tell what it does; that click is the user's")
         }
         if elementLabel.range(of: ScreenControl.irreversibleWordsPatternForSharing, options: [.regularExpression, .caseInsensitive]) != nil {
-            throw BrowserError(message: "not clicking \"\(elementLabel)\": that can't be undone, so it's the user's click")
+            throw BrowserError(message: "not clicking \"\(elementLabel.prefix(100))\": that can't be undone, so it's the user's click")
         }
+    }
+
+    private static func validatedWebAddress(_ addressText: String) throws -> URL {
+        guard let address = URL(string: addressText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              address.scheme == "https" || address.scheme == "http" else {
+            throw BrowserError(message: "that isn't a web address")
+        }
+        return address
+    }
+
+    // MARK: - Apple Events versions (no extension)
+
+    /// Clicks the element with this id (from the last readPage). Refuses Send/Buy/Delete-style controls.
+    private static func clickElementUsingAppleEvents(id elementIdentifier: Int) throws -> String {
+        let elementLabel = try describeElement(id: elementIdentifier)
+        try checkClickIsAllowed(elementLabel: elementLabel, elementIdentifier: elementIdentifier)
         let javaScript = """
         (function () {
           var node = document.querySelector('[data-orch-id="\(elementIdentifier)"]');
@@ -126,7 +239,7 @@ enum BrowserControl {
     }
 
     /// Types text into a field by id (replaces what's there). Never into password fields.
-    static func typeIntoElement(id elementIdentifier: Int, text textToType: String) throws -> String {
+    private static func typeIntoElementUsingAppleEvents(id elementIdentifier: Int, text textToType: String) throws -> String {
         guard !textToType.isEmpty else { throw BrowserError(message: "nothing to type") }
         let textAsJavaScriptLiteral = javaScriptStringLiteral(textToType)
         let javaScript = """
@@ -163,22 +276,19 @@ enum BrowserControl {
         }
     }
 
-    static func scrollPage(screens screenCount: Double) throws -> String {
+    private static func scrollPageUsingAppleEvents(screens screenCount: Double) throws -> String {
         _ = try runJavaScriptInFrontTab("window.scrollBy(0, window.innerHeight * 0.8 * \(screenCount)); 'ok'")
         return "scrolled"
     }
 
-    static func goBack() throws -> String {
+    private static func goBackUsingAppleEvents() throws -> String {
         _ = try runJavaScriptInFrontTab("history.back(); 'ok'")
         return "went back"
     }
 
     /// Opens a link in the front tab (https only).
-    static func openAddress(_ addressText: String) throws -> String {
-        guard let address = URL(string: addressText.trimmingCharacters(in: .whitespacesAndNewlines)),
-              address.scheme == "https" || address.scheme == "http" else {
-            throw BrowserError(message: "that isn't a web address")
-        }
+    private static func openAddressUsingAppleEvents(_ addressText: String) throws -> String {
+        let address = try validatedWebAddress(addressText)
         _ = try runJavaScriptInFrontTab("location.href = \(javaScriptStringLiteral(address.absoluteString)); 'ok'")
         return "opening \(address.absoluteString)"
     }

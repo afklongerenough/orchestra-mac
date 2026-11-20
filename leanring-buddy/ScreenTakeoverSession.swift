@@ -66,13 +66,14 @@ final class ScreenTakeoverSession {
                  label: screenCapture.label + " (coordinates: 0-1000 grid over this image)")
             }
 
+            let browserPageContext = await Self.browserPageContextForPrompt()
             let stepPrompt = """
             goal: \(goal)
             step \(stepNumber) of at most \(maximumStepCount).
             actions done so far:
             \(actionLog.isEmpty ? "(none yet)" : actionLog.joined(separator: "\n"))
             look at the screen now and give the next actions.
-            """ + Self.browserPageContextForPrompt()
+            """ + browserPageContext
 
             var commandTexts: [String] = []
             var previousReplyHadNoActions = false
@@ -129,8 +130,9 @@ final class ScreenTakeoverSession {
                     return Outcome(finished: true, spokenSummary: commandArgument.isEmpty ? "done." : commandArgument)
                 case "ask", "stop":
                     return Outcome(finished: false, spokenSummary: commandArgument.isEmpty ? "i need you for the next bit." : commandArgument)
-                case "web_click", "web_type", "web_open", "web_scroll", "web_back":
-                    actionLog.append("- \(commandText) → \(Self.runBrowserCommand(named: commandName, argument: commandArgument))")
+                case "web_click", "web_type", "web_open", "web_scroll", "web_back", "web_upload":
+                    let browserCommandResult = await Self.runBrowserCommand(named: commandName, argument: commandArgument)
+                    actionLog.append("- \(commandText) → \(browserCommandResult)")
                     if commandName == "web_click" || commandName == "web_open" || commandName == "web_back" {
                         // Give the page time to load before the next action.
                         try? await Task.sleep(nanoseconds: 900_000_000)
@@ -218,33 +220,36 @@ final class ScreenTakeoverSession {
 
     /// When a browser is in front and browser control is on, the page's
     /// elements (with ids) go into the prompt: clicking by id beats pixels.
-    private static func browserPageContextForPrompt() -> String {
+    private static func browserPageContextForPrompt() async -> String {
         guard let browserName = BrowserControl.frontmostBrowserName else { return "" }
         do {
-            let pageSummary = try BrowserControl.readPage(maximumTextCharacters: 1500)
+            let pageSummary = try await BrowserControl.readPage(maximumTextCharacters: 1500)
             return "\n\nthe front app is \(browserName). its page, read directly (prefer web_click / web_type with these ids over pixel clicks inside the page):\n\(pageSummary)"
         } catch {
             return "\n\n(the front app is \(browserName), but reading the page failed: \(error.localizedDescription). use pixel clicks.)"
         }
     }
 
-    private static func runBrowserCommand(named commandName: String, argument commandArgument: String) -> String {
+    private static func runBrowserCommand(named commandName: String, argument commandArgument: String) async -> String {
         let argumentParts = commandArgument.split(separator: " ", maxSplits: 1).map(String.init)
         let elementIdentifier = argumentParts.first.flatMap { Int($0.filter(\.isNumber)) }
         do {
             switch commandName {
             case "web_click":
                 guard let elementIdentifier else { return "skipped: needs an element id" }
-                return try BrowserControl.clickElement(id: elementIdentifier)
+                return try await BrowserControl.clickElement(id: elementIdentifier)
             case "web_type":
                 guard let elementIdentifier, argumentParts.count == 2 else { return "skipped: write it as web_type <id> <text>" }
-                return try BrowserControl.typeIntoElement(id: elementIdentifier, text: argumentParts[1])
+                return try await BrowserControl.typeIntoElement(id: elementIdentifier, text: argumentParts[1])
+            case "web_upload":
+                guard let elementIdentifier, argumentParts.count == 2 else { return "skipped: write it as web_upload <id> <file path>" }
+                return try await BrowserControl.uploadFile(toElement: elementIdentifier, filePath: argumentParts[1])
             case "web_open":
-                return try BrowserControl.openAddress(commandArgument)
+                return try await BrowserControl.openAddress(commandArgument)
             case "web_scroll":
-                return try BrowserControl.scrollPage(screens: Double(commandArgument.trimmingCharacters(in: .whitespaces)) ?? 1)
+                return try await BrowserControl.scrollPage(screens: Double(commandArgument.trimmingCharacters(in: .whitespaces)) ?? 1)
             default:
-                return try BrowserControl.goBack()
+                return try await BrowserControl.goBack()
             }
         } catch {
             return "failed: \(error.localizedDescription)"
@@ -312,6 +317,7 @@ final class ScreenTakeoverSession {
     [DO: web_open https://...] go to an address in the front tab
     [DO: web_scroll 1]         scroll the page one screen (negative = up)
     [DO: web_back]             go back
+    [DO: web_upload 4 ~/Downloads/file.pdf]  attach a file the user named to file picker 4 (Chrome extension only)
     [DO: done short spoken summary of what you did]
     [DO: ask the one question you need the user to answer]
 

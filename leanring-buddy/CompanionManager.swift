@@ -244,6 +244,7 @@ final class CompanionManager: ObservableObject {
         Task { await MCPConnectorManager.shared.refreshAllTools() }
         SpotifyLibrary.shared.startRecordingLocalHistory()
         startWakeWordReconciling()
+        BrowserExtensionBridge.shared.startIfSetUp()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
         bindVoiceStateObservation()
@@ -1444,19 +1445,27 @@ final class CompanionManager: ObservableObject {
                 do {
                     switch action.lowercased() {
                     case "read":
-                        return try BrowserControl.readPage()
+                        return try await BrowserControl.readPage()
                     case "click":
                         guard let elementIdentifier else { return "click needs an id from read" }
-                        return try BrowserControl.clickElement(id: elementIdentifier)
+                        return try await BrowserControl.clickElement(id: elementIdentifier)
                     case "type":
                         guard let elementIdentifier else { return "type needs an id from read" }
-                        return try BrowserControl.typeIntoElement(id: elementIdentifier, text: text)
+                        return try await BrowserControl.typeIntoElement(id: elementIdentifier, text: text)
                     case "open":
-                        return try BrowserControl.openAddress(text)
+                        return try await BrowserControl.openAddress(text)
                     case "scroll":
-                        return try BrowserControl.scrollPage(screens: Double(text) ?? 1)
+                        return try await BrowserControl.scrollPage(screens: Double(text) ?? 1)
                     case "back":
-                        return try BrowserControl.goBack()
+                        return try await BrowserControl.goBack()
+                    case "tabs":
+                        return try await BrowserControl.listTabs()
+                    case "switch_tab":
+                        guard let elementIdentifier else { return "switch_tab needs a tab id from tabs" }
+                        return try await BrowserControl.switchToTab(tabIdentifier: elementIdentifier)
+                    case "upload":
+                        guard let elementIdentifier else { return "upload needs the id of a file picker from read" }
+                        return try await BrowserControl.uploadFile(toElement: elementIdentifier, filePath: text)
                     default:
                         return "unknown browser action \(action)"
                     }
