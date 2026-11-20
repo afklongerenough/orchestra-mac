@@ -43,6 +43,10 @@ final class BrowserExtensionBridge: ObservableObject {
     /// Starts listening if the extension was set up before (cheap: one local port).
     func startIfSetUp() {
         guard KeychainStore.readCustomSecret(named: Self.tokenSecretName) != nil else { return }
+        // Keep the extension's code in step with this build (Chrome picks it up
+        // the next time the extension restarts; config.js and its token stay).
+        try? ChromeExtensionFiles.manifestJSON.write(to: Self.extensionFolderURL.appendingPathComponent("manifest.json"), atomically: true, encoding: .utf8)
+        try? ChromeExtensionFiles.backgroundJavaScript.write(to: Self.extensionFolderURL.appendingPathComponent("background.js"), atomically: true, encoding: .utf8)
         startListening()
     }
 
@@ -100,6 +104,18 @@ final class BrowserExtensionBridge: ObservableObject {
         }
         newListener.newConnectionHandler = { [weak self] connection in
             Task { @MainActor [weak self] in self?.accept(connection) }
+        }
+        // If the port is taken (a second copy of Orchestra, another app), say so
+        // and let "Set up" try again instead of waiting forever.
+        newListener.stateUpdateHandler = { [weak self] listenerState in
+            guard case .failed(let listenerError) = listenerState else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.listener?.cancel()
+                self.listener = nil
+                self.statusText = "couldn't listen on port \(ChromeExtensionFiles.bridgePort) (\(listenerError.localizedDescription)); quit other copies of Orchestra and press Set up again"
+                OrchestraLog.write("🧩 Chrome extension bridge: listener failed: \(listenerError.localizedDescription)")
+            }
         }
         newListener.start(queue: .main)
         listener = newListener
@@ -186,8 +202,10 @@ final class BrowserExtensionBridge: ObservableObject {
 
     // MARK: - Commands
 
-    /// Sends one command to the extension and waits (up to 20 s) for its answer.
+    /// Sends one command to the extension and waits for its answer (8 s, or 20 s
+    /// for uploads). Kept short: Live mode waits on this while the user talks.
     func send(_ command: [String: Any]) async throws -> String {
+        let answerTimeoutNanoseconds: UInt64 = (command["action"] as? String) == "upload" ? 20_000_000_000 : 8_000_000_000
         guard let authenticatedConnection, isExtensionConnected else {
             throw BridgeError(message: "the Chrome extension isn't connected")
         }
@@ -208,7 +226,7 @@ final class BrowserExtensionBridge: ObservableObject {
                 }
             })
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                try? await Task.sleep(nanoseconds: answerTimeoutNanoseconds)
                 self.pendingRepliesByRequestIdentifier.removeValue(forKey: requestIdentifier)?
                     .resume(throwing: BridgeError(message: "the Chrome extension didn't answer in time"))
             }

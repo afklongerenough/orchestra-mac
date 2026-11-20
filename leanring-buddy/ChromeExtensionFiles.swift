@@ -100,7 +100,7 @@ enum ChromeExtensionFiles {
       switch (message.action) {
         case 'read': return await runInPage(readPageInTab, [message.maxText || 3500]);
         case 'describe': return await runInPage(describeElementInTab, [Number(message.elementId)]);
-        case 'click': return await runInPage(clickElementInTab, [Number(message.elementId)]);
+        case 'click': return await runInPage(clickElementInTab, [Number(message.elementId), String(message.expectedLabel || '')]);
         case 'type': return await runInPage(typeIntoElementInTab, [Number(message.elementId), String(message.text || '')]);
         case 'scroll': return await runInPage((screens) => { window.scrollBy(0, window.innerHeight * 0.8 * screens); return 'scrolled'; }, [Number(message.screens) || 1]);
         case 'back': { const tab = await activeTab(); await chrome.tabs.goBack(tab.id); return 'went back'; }
@@ -190,9 +190,23 @@ enum ChromeExtensionFiles {
       return (fullLabel + (visibleText && fullLabel.indexOf(visibleText) < 0 ? ' ' + visibleText : '')) || '(no label)';
     }
 
-    function clickElementInTab(elementId) {
+    function clickElementInTab(elementId, expectedLabel) {
+      // Same label as describeElementInTab, worked out again right before the click.
+      function orchestraLabel(node, maximumLength) {
+        const isButtonLikeInput = node.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(node.type || '');
+        let imageAlt = '';
+        const innerImage = node.querySelector ? node.querySelector('img[alt], svg[aria-label]') : null;
+        if (innerImage) imageAlt = innerImage.getAttribute('alt') || innerImage.getAttribute('aria-label') || '';
+        const parts = [node.getAttribute('aria-label'), (node.tagName === 'INPUT' || node.tagName === 'TEXTAREA' || node.tagName === 'SELECT') ? '' : node.innerText,
+                       isButtonLikeInput ? node.value : '', node.getAttribute('placeholder'), node.getAttribute('title'), node.getAttribute('name'), imageAlt];
+        return parts.filter((part) => part).join(' ').replace(/\s+/g, ' ').trim().slice(0, maximumLength || 100);
+      }
       const node = document.querySelector('[data-orch-id="' + elementId + '"]');
       if (!node) return 'missing';
+      const fullLabel = orchestraLabel(node, 2000);
+      const visibleText = (node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
+      const currentLabel = (fullLabel + (visibleText && fullLabel.indexOf(visibleText) < 0 ? ' ' + visibleText : '')) || '(no label)';
+      if (currentLabel !== expectedLabel) return 'changed';
       node.scrollIntoView({ block: 'center' });
       node.focus();
       node.click();

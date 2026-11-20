@@ -122,7 +122,10 @@ enum BrowserControl {
         let elementLabel = try await extensionBridge.send(["action": "describe", "elementId": elementIdentifier])
         guard !elementLabel.isEmpty else { throw BrowserError(message: "element \(elementIdentifier) is gone; read the page again") }
         try checkClickIsAllowed(elementLabel: elementLabel, elementIdentifier: elementIdentifier)
-        let clickResult = try await extensionBridge.send(["action": "click", "elementId": elementIdentifier])
+        // The page re-checks the label right before clicking, so a re-render
+        // between the two messages can't swap in a different button.
+        let clickResult = try await extensionBridge.send(["action": "click", "elementId": elementIdentifier, "expectedLabel": elementLabel])
+        if clickResult == "changed" { throw BrowserError(message: "element \(elementIdentifier) changed since the read; read the page again") }
         guard clickResult == "clicked" else { throw BrowserError(message: "element \(elementIdentifier) is gone; read the page again") }
         return "clicked \"\(elementLabel.prefix(100))\""
     }
@@ -186,12 +189,19 @@ enum BrowserControl {
         let expandedPath = (filePath.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
         let resolvedPath = URL(fileURLWithPath: expandedPath).standardizedFileURL.resolvingSymlinksInPath().path
         let homePath = FileManager.default.homeDirectoryForCurrentUser.path
-        let allowedFolderPaths = ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Orchestra"]
+        let allowedFolderPaths = ["Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music"]
             .map { homePath + "/" + $0 + "/" }
-        guard allowedFolderPaths.contains(where: { resolvedPath.hasPrefix($0) }) else {
-            throw BrowserError(message: "only files in Desktop, Documents, Downloads, Pictures, Movies, Music or ~/Orchestra can be uploaded")
+        // Inside ~/Orchestra only an agent's files/ folder: never the extension's
+        // token, job briefs, notes, chat history or the log.
+        let isAgentDeliverable = resolvedPath.range(of: "^" + NSRegularExpression.escapedPattern(for: homePath) + "/Orchestra/Agents/[^/]+/files/",
+                                                    options: .regularExpression) != nil
+        guard allowedFolderPaths.contains(where: { resolvedPath.hasPrefix($0) }) || isAgentDeliverable else {
+            throw BrowserError(message: "only files in Desktop, Documents, Downloads, Pictures, Movies or Music (or an agent's files folder) can be uploaded")
         }
-        guard FileManager.default.fileExists(atPath: resolvedPath) else { throw BrowserError(message: "there's no file at \(resolvedPath)") }
+        let fileValues = try? URL(fileURLWithPath: resolvedPath).resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard fileValues?.isRegularFile == true else { throw BrowserError(message: "there's no file at \(resolvedPath)") }
+        let maximumUploadBytes = 200 * 1024 * 1024
+        guard (fileValues?.fileSize ?? 0) <= maximumUploadBytes else { throw BrowserError(message: "that file is over 200 MB; the user should attach it themselves") }
         return try await extensionBridge.send(["action": "upload", "elementId": elementIdentifier, "path": resolvedPath])
     }
 
