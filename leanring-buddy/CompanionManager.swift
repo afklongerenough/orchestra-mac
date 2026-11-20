@@ -250,6 +250,7 @@ final class CompanionManager: ObservableObject {
         bindAudioPowerLevel()
         bindShortcutTransitions()
         orchestraJobManager.onJobFinishedAnnouncement = { [weak self] announcement in
+            self?.appendChatMessage(isFromUser: false, text: announcement)
             self?.queueJobAnnouncement(announcement)
         }
         connectJobManagerToMacActions()
@@ -665,6 +666,7 @@ final class CompanionManager: ObservableObject {
                     submitDraftText: { [weak self] finalTranscript in
                         self?.lastTranscript = finalTranscript
                         self?.showCaptionLine(isUserSpeech: true, fullText: finalTranscript)
+                        self?.appendChatMessage(isFromUser: true, text: finalTranscript)
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
@@ -741,6 +743,52 @@ final class CompanionManager: ObservableObject {
         } catch {
             return "i got a result from the connector but couldn't put it into words just now."
         }
+    }
+
+    // MARK: - Chat log (Home window)
+
+    struct ChatMessage: Identifiable, Codable, Equatable {
+        let id: UUID
+        let isFromUser: Bool
+        let text: String
+        let date: Date
+    }
+
+    /// Everything said or typed with Orchestra (newest last), shown in the Home window.
+    @Published private(set) var chatMessages: [ChatMessage] = CompanionManager.loadChatMessages()
+
+    private nonisolated static var chatLogFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Orchestra", isDirectory: true)
+            .appendingPathComponent("chat-history.json")
+    }
+
+    private nonisolated static func loadChatMessages() -> [ChatMessage] {
+        guard let chatData = try? Data(contentsOf: chatLogFileURL) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([ChatMessage].self, from: chatData)) ?? []
+    }
+
+    func appendChatMessage(isFromUser: Bool, text: String) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+        chatMessages.append(ChatMessage(id: UUID(), isFromUser: isFromUser, text: trimmedText, date: Date()))
+        if chatMessages.count > 300 { chatMessages.removeFirst(chatMessages.count - 300) }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let chatData = try? encoder.encode(chatMessages) {
+            try? chatData.write(to: Self.chatLogFileURL, options: .atomic)
+        }
+    }
+
+    /// Typed into the Home window: answered like push-to-talk (spoken too).
+    func sendTypedMessage(_ typedText: String) {
+        let trimmedText = typedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+        lastTranscript = trimmedText
+        appendChatMessage(isFromUser: true, text: trimmedText)
+        sendTranscriptToClaudeWithScreenshot(transcript: trimmedText)
     }
 
     // MARK: - Captions
@@ -1186,6 +1234,7 @@ final class CompanionManager: ObservableObject {
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     showCaptionLine(isUserSpeech: false, fullText: spokenText)
+                    appendChatMessage(isFromUser: false, text: spokenText)
                     do {
                         try await speechOutputClient.speakText(spokenText)
                         // speakText returns after player.play() — audio is now playing

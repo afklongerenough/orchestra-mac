@@ -1291,6 +1291,23 @@ struct CompanionPanelView: View {
     private var footerSection: some View {
         HStack {
             Button(action: {
+                NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+                HomeWindowManager.shared.showHomeWindow(companionManager: companionManager)
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "macwindow")
+                        .font(.system(size: 11, weight: .medium))
+                    Text("Home")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .foregroundColor(DS.Colors.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+
+            Spacer().frame(width: 14)
+
+            Button(action: {
                 NSApp.terminate(nil)
             }) {
                 HStack(spacing: 6) {
