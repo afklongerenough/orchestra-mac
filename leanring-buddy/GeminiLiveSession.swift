@@ -56,6 +56,8 @@ final class GeminiLiveSession: NSObject {
     var onMicrophoneLevel: ((CGFloat) -> Void)?
     /// Pieces of what was said, as Gemini transcribes them (for captions).
     var onTranscription: ((_ isUserSpeech: Bool, _ textChunk: String) -> Void)?
+    /// The user talked over Orchestra (its reply was cut off).
+    var onInterrupted: (() -> Void)?
 
     private let toolHandlers: ToolHandlers
     private let systemInstructionText: String
@@ -357,6 +359,7 @@ final class GeminiLiveSession: NSObject {
             if (serverContent["interrupted"] as? Bool) == true {
                 // the user started talking: drop whatever we were saying.
                 OrchestraLog.write("🎙️ Live: interrupted (heard speech while talking)")
+                onInterrupted?()
                 modelSpeechPlaysUntil = .distantPast
                 if isPlayerNodeAttached && audioEngine.isRunning {
                     playerNode.stop()

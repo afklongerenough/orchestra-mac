@@ -50,7 +50,8 @@ final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
         ].compactMap { $0 }
 
         for preferredLocale in preferredLocales {
-            if let speechRecognizer = SFSpeechRecognizer(locale: preferredLocale) {
+            // A supported language may still not be ready on this Mac; skip it then.
+            if let speechRecognizer = SFSpeechRecognizer(locale: preferredLocale), speechRecognizer.isAvailable {
                 return speechRecognizer
             }
         }

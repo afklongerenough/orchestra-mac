@@ -833,6 +833,7 @@ final class CompanionManager: ObservableObject {
             // Stay up while Orchestra is still talking, then fade a few seconds later.
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             while self?.speechOutputClient.isPlaying == true {
+                guard !Task.isCancelled else { return }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
             guard !Task.isCancelled else { return }
@@ -1513,6 +1514,11 @@ final class CompanionManager: ObservableObject {
         }
         newLiveSession.onTranscription = { [weak self] isUserSpeech, textChunk in
             self?.appendCaptionText(isUserSpeech: isUserSpeech, textChunk: textChunk)
+        }
+        newLiveSession.onInterrupted = { [weak self] in
+            // The user cut in: drop the reply line they won't hear the rest of.
+            guard let self, let lastLine = self.captionLines.last, !lastLine.isUserSpeech else { return }
+            self.captionLines.removeLast()
         }
         geminiLiveSession = newLiveSession
         newLiveSession.start()
