@@ -663,6 +663,7 @@ final class CompanionManager: ObservableObject {
                     },
                     submitDraftText: { [weak self] finalTranscript in
                         self?.lastTranscript = finalTranscript
+                        self?.showCaptionLine(isUserSpeech: true, fullText: finalTranscript)
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
@@ -693,7 +694,57 @@ final class CompanionManager: ObservableObject {
     private static var userNamePromptLine: String {
         let savedName = (UserDefaults.standard.string(forKey: userDisplayNameDefaultsKey) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return savedName.isEmpty ? "" : "\n\nthe user's name is \(savedName). use it now and then, naturally."
+        return (savedName.isEmpty ? "" : "\n\nthe user's name is \(savedName). use it now and then, naturally.")
+            + OrchestraLanguageSettings.replyLanguagePromptLine
+    }
+
+    // MARK: - Captions
+
+    struct CaptionLine: Identifiable, Equatable {
+        let id = UUID()
+        let isUserSpeech: Bool
+        var text: String
+    }
+
+    /// The last line or two of what was said, shown as subtitles.
+    @Published private(set) var captionLines: [CaptionLine] = []
+    private var captionClearTask: Task<Void, Never>?
+
+    /// Live mode sends speech in pieces: grow the current line while the same
+    /// person keeps talking, start a new one when the speaker changes.
+    func appendCaptionText(isUserSpeech: Bool, textChunk: String) {
+        guard OrchestraLanguageSettings.areCaptionsEnabled, !textChunk.isEmpty else { return }
+        if var lastLine = captionLines.last, lastLine.isUserSpeech == isUserSpeech {
+            lastLine.text = String((lastLine.text + textChunk).suffix(220))
+            captionLines[captionLines.count - 1] = lastLine
+        } else {
+            captionLines.append(CaptionLine(isUserSpeech: isUserSpeech, text: textChunk.trimmingCharacters(in: .whitespaces)))
+            if captionLines.count > 2 { captionLines.removeFirst(captionLines.count - 2) }
+        }
+        scheduleCaptionClear()
+    }
+
+    /// Push-to-talk: a whole sentence at once.
+    func showCaptionLine(isUserSpeech: Bool, fullText: String) {
+        guard OrchestraLanguageSettings.areCaptionsEnabled else { return }
+        let trimmedText = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else { return }
+        captionLines.append(CaptionLine(isUserSpeech: isUserSpeech, text: String(trimmedText.prefix(300))))
+        if captionLines.count > 2 { captionLines.removeFirst(captionLines.count - 2) }
+        scheduleCaptionClear()
+    }
+
+    private func scheduleCaptionClear() {
+        captionClearTask?.cancel()
+        captionClearTask = Task { @MainActor [weak self] in
+            // Stay up while Orchestra is still talking, then fade a few seconds later.
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            while self?.speechOutputClient.isPlaying == true {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            guard !Task.isCancelled else { return }
+            self?.captionLines = []
+        }
     }
 
     private static let companionVoiceResponseSystemPrompt = """
@@ -1033,6 +1084,7 @@ final class CompanionManager: ObservableObject {
                 // Play the response via TTS. Keep the spinner (processing state)
                 // until the audio actually starts playing, then switch to responding.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    showCaptionLine(isUserSpeech: false, fullText: spokenText)
                     do {
                         try await speechOutputClient.speakText(spokenText)
                         // speakText returns after player.play() — audio is now playing
@@ -1293,6 +1345,9 @@ final class CompanionManager: ObservableObject {
         }
         newLiveSession.onMicrophoneLevel = { [weak self] microphoneLevel in
             self?.currentAudioPowerLevel = microphoneLevel
+        }
+        newLiveSession.onTranscription = { [weak self] isUserSpeech, textChunk in
+            self?.appendCaptionText(isUserSpeech: isUserSpeech, textChunk: textChunk)
         }
         geminiLiveSession = newLiveSession
         newLiveSession.start()

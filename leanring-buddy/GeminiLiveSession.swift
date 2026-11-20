@@ -53,6 +53,8 @@ final class GeminiLiveSession: NSObject {
     var onStateChange: ((LiveState) -> Void)?
     /// Rough mic level 0...1 for the waveform.
     var onMicrophoneLevel: ((CGFloat) -> Void)?
+    /// Pieces of what was said, as Gemini transcribes them (for captions).
+    var onTranscription: ((_ isUserSpeech: Bool, _ textChunk: String) -> Void)?
 
     private let toolHandlers: ToolHandlers
     private let systemInstructionText: String
@@ -330,6 +332,11 @@ final class GeminiLiveSession: NSObject {
                 }
                 lastUserSpeechDate = Date()
                 recentUserSpeechText = String((recentUserSpeechText + " " + spokenText).suffix(400))
+                onTranscription?(true, spokenText)
+            }
+            if let outputTranscription = serverContent["outputTranscription"] as? [String: Any],
+               let spokenReplyText = outputTranscription["text"] as? String {
+                onTranscription?(false, spokenReplyText)
             }
             if (serverContent["interrupted"] as? Bool) == true {
                 // the user started talking: drop whatever we were saying.

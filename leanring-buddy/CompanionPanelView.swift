@@ -15,6 +15,9 @@ struct CompanionPanelView: View {
     @State private var geminiAPIKeyInput: String = ""
     @State private var hermesBridgeURLInput: String = ""
     @ObservedObject private var orchestraUpdater = OrchestraUpdater.shared
+    @AppStorage(OrchestraLanguageSettings.captionsEnabledDefaultsKey) private var areCaptionsEnabled: Bool = true
+    @AppStorage(OrchestraLanguageSettings.replyLanguageDefaultsKey) private var replyLanguage: String = "auto"
+    @AppStorage(OrchestraLanguageSettings.dictationLocaleDefaultsKey) private var dictationLocaleIdentifier: String = ""
     @State private var spotifyAccountStatusText: String = ""
     @State private var isConnectingSpotifyAccount = false
     /// Saved as soon as it's typed (no Save needed).
@@ -56,6 +59,9 @@ struct CompanionPanelView: View {
                     .padding(.horizontal, 16)
 
                 voicePickerRow
+                    .padding(.horizontal, 16)
+
+                languageRows
                     .padding(.horizontal, 16)
 
                 screenPrivacyRows
@@ -739,6 +745,74 @@ struct CompanionPanelView: View {
 
     @AppStorage(SpeechOutputClient.naturalVoiceEnabledDefaultsKey) private var isNaturalVoiceEnabled: Bool = true
     @AppStorage(SpeechOutputClient.naturalVoiceNameDefaultsKey) private var naturalVoiceName: String = "Achird"
+
+    // MARK: - Captions & languages
+
+    private var languageRows: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Captions")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                Toggle("", isOn: $areCaptionsEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .pointerCursor()
+            }
+            .padding(.vertical, 4)
+
+            HStack {
+                Text("Reply language")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                Menu {
+                    ForEach(OrchestraLanguageSettings.replyLanguageChoices, id: \.self) { languageChoice in
+                        Button(languageChoice == "auto" ? "Same as I speak" : languageChoice) { replyLanguage = languageChoice }
+                    }
+                } label: {
+                    Text(replyLanguage == "auto" ? "Same as I speak" : replyLanguage)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .pointerCursor()
+            }
+            .padding(.vertical, 4)
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Push-to-talk language")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text("Live mode understands any language by itself")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                Spacer()
+                Menu {
+                    Button("Mac's language") { dictationLocaleIdentifier = "" }
+                    Divider()
+                    ForEach(OrchestraLanguageSettings.dictationLocaleChoices(), id: \.identifier) { localeChoice in
+                        Button(localeChoice.name) { dictationLocaleIdentifier = localeChoice.identifier }
+                    }
+                } label: {
+                    Text(dictationLocaleIdentifier.isEmpty
+                         ? "Mac's language"
+                         : (Locale.current.localizedString(forIdentifier: dictationLocaleIdentifier) ?? dictationLocaleIdentifier))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textPrimary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .pointerCursor()
+            }
+            .padding(.vertical, 4)
+        }
+    }
 
     private var voicePickerRow: some View {
         HStack {

@@ -234,3 +234,34 @@ struct OrchestraStatusPill: View {
         }
     }
 }
+
+/// Subtitles at the bottom of the main screen: what the user said and what
+/// Orchestra is saying (the last line or two).
+struct OrchestraCaptionBar: View {
+    let captionLines: [CompanionManager.CaptionLine]
+
+    var body: some View {
+        if !captionLines.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(captionLines) { captionLine in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(captionLine.isUserSpeech ? "You" : "Orchestra")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(captionLine.isUserSpeech ? Color.white.opacity(0.6) : Color(red: 0.45, green: 0.7, blue: 1.0))
+                            .frame(width: 66, alignment: .leading)
+                        Text(captionLine.text)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 760, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.black.opacity(0.78)))
+            .transition(.opacity)
+        }
+    }
+}

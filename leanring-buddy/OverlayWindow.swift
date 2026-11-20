@@ -210,6 +210,16 @@ struct BlueCursorView: View {
                 .allowsHitTesting(false)
                 .animation(.spring(response: 0.35, dampingFraction: 0.8), value: companionManager.runningJobCount)
                 .animation(.spring(response: 0.35, dampingFraction: 0.8), value: companionManager.isLiveSessionActive)
+
+                // Captions (subtitles) along the bottom of the main screen.
+                VStack {
+                    Spacer()
+                    OrchestraCaptionBar(captionLines: companionManager.captionLines)
+                        .padding(.bottom, 90)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+                .animation(.easeOut(duration: 0.2), value: companionManager.captionLines)
             }
 
             // Welcome speech bubble (first launch only)

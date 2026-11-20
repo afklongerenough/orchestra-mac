@@ -42,10 +42,12 @@ final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
     }
 
     private static func makeBestAvailableSpeechRecognizer() -> SFSpeechRecognizer? {
+        // The language picked in the Orchestra menu comes first.
         let preferredLocales = [
+            OrchestraLanguageSettings.dictationLocale,
             Locale.autoupdatingCurrent,
             Locale(identifier: "en-US")
-        ]
+        ].compactMap { $0 }
 
         for preferredLocale in preferredLocales {
             if let speechRecognizer = SFSpeechRecognizer(locale: preferredLocale) {
