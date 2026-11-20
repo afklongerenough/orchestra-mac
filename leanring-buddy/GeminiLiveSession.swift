@@ -251,6 +251,16 @@ final class GeminiLiveSession: NSObject {
             ] as [String: Any]
         ],
         [
+            "name": "connector_tool",
+            "description": "Call a tool on one of the user's connected apps (custom connectors listed in your instructions). connector = its name, tool = the tool name, arguments_json = a JSON object string of arguments (\"{}\" if none). Risky tools are parked until the user says yes.",
+            "parameters": stringParameters(["connector", "tool", "arguments_json"], required: ["connector", "tool"])
+        ],
+        [
+            "name": "confirm_connector_action",
+            "description": "Run the parked connector action, only right after the user clearly said yes to it.",
+            "parameters": stringParameters([], required: [])
+        ],
+        [
             "name": "stop_screen_takeover",
             "description": "Stop a running take_over_screen right away (when the user says stop / wait / cancel).",
             "parameters": stringParameters([], required: [])
@@ -402,6 +412,14 @@ final class GeminiLiveSession: NSObject {
             return toolHandlers.takeOverScreen(arguments["goal"] as? String ?? "")
         case "stop_screen_takeover":
             return toolHandlers.stopTakeover()
+        case "connector_tool":
+            return await MCPConnectorManager.shared.runTool(
+                connectorIdentifier: (arguments["connector"] as? String ?? "").lowercased(),
+                toolName: arguments["tool"] as? String ?? "",
+                argumentsJSONText: arguments["arguments_json"] as? String ?? "{}")
+        case "confirm_connector_action":
+            // Checked against what the user actually said, not the model's word.
+            return await MCPConnectorManager.shared.runPendingRiskyCall(afterUserSaid: recentUserSpeechText)
         case "show_me_how":
             return toolHandlers.showMeHow(arguments["goal"] as? String ?? "")
         case "browser":

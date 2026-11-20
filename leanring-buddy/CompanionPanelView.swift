@@ -19,6 +19,11 @@ struct CompanionPanelView: View {
     @AppStorage(OrchestraLanguageSettings.replyLanguageDefaultsKey) private var replyLanguage: String = "auto"
     @AppStorage(OrchestraLanguageSettings.dictationLocaleDefaultsKey) private var dictationLocaleIdentifier: String = ""
     @State private var spotifyAccountStatusText: String = ""
+    @ObservedObject private var connectorManager = MCPConnectorManager.shared
+    @State private var newConnectorNameInput: String = ""
+    @State private var newConnectorURLInput: String = ""
+    @State private var newConnectorTokenInput: String = ""
+    @State private var connectorFormMessage: String = ""
     @State private var isConnectingSpotifyAccount = false
     /// Saved as soon as it's typed (no Save needed).
     @AppStorage("userDisplayName") private var userDisplayNameInput: String = ""
@@ -992,6 +997,7 @@ struct CompanionPanelView: View {
                 )
                 connectionTextField(placeholder: "Spotify client secret (optional)", text: $spotifyClientSecretInput, isSecure: true)
                 spotifyAccountRow
+                connectorsSection
 
                 Button(action: {
                     companionManager.saveHermesBridgeSettings(
@@ -1056,6 +1062,80 @@ struct CompanionPanelView: View {
             RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                 .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
         )
+    }
+
+    // MARK: - Custom connectors (MCP servers)
+
+    private var connectorsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Connectors (MCP servers)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+                .padding(.top, 6)
+            ForEach(connectorManager.connectors) { connector in
+                HStack(spacing: 6) {
+                    Toggle("", isOn: Binding(
+                        get: { connector.isEnabled },
+                        set: { connectorManager.setConnector(connectorIdentifier: connector.id, enabled: $0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .pointerCursor()
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(connector.id)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+                        Text(connectorManager.statusByConnector[connector.id] ?? (connector.isEnabled ? "not checked yet" : "off"))
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button("Refresh") {
+                        Task { await connectorManager.refreshTools(connectorIdentifier: connector.id) }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .pointerCursor()
+                    Button("Remove") {
+                        connectorManager.removeConnector(connectorIdentifier: connector.id)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .pointerCursor()
+                }
+            }
+            connectionTextField(placeholder: "New connector name (e.g. notion)", text: $newConnectorNameInput, isSecure: false)
+            connectionTextField(placeholder: "MCP server URL (https://…)", text: $newConnectorURLInput, isSecure: false)
+            connectionTextField(placeholder: "Token (if the server needs one)", text: $newConnectorTokenInput, isSecure: true)
+            HStack {
+                if !connectorFormMessage.isEmpty {
+                    Text(connectorFormMessage)
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                Spacer()
+                Button("Add connector") {
+                    if let errorMessage = connectorManager.addConnector(name: newConnectorNameInput,
+                                                                        urlText: newConnectorURLInput,
+                                                                        token: newConnectorTokenInput) {
+                        connectorFormMessage = errorMessage
+                    } else {
+                        connectorFormMessage = "added, checking its tools…"
+                        newConnectorNameInput = ""
+                        newConnectorURLInput = ""
+                        newConnectorTokenInput = ""
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Colors.accent)
+                .pointerCursor()
+            }
+        }
     }
 
     // MARK: - Spotify account

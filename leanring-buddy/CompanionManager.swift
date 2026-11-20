@@ -241,6 +241,7 @@ final class CompanionManager: ObservableObject {
     func start() {
         refreshAllPermissions()
         OrchestraUpdater.shared.startPeriodicChecks()
+        Task { await MCPConnectorManager.shared.refreshAllTools() }
         SpotifyLibrary.shared.startRecordingLocalHistory()
         startWakeWordReconciling()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
@@ -698,6 +699,39 @@ final class CompanionManager: ObservableObject {
             + OrchestraLanguageSettings.replyLanguagePromptLine
     }
 
+    // MARK: - Custom connectors
+
+    /// Tells the push-to-talk brain which connector tools exist.
+    private static var connectorPromptSection: String {
+        let connectorManager = MCPConnectorManager.shared
+        guard connectorManager.hasUsableTools else { return "" }
+        return "\n\nthe user's connected apps (custom connectors). to use one, add exactly one [CONNECTOR: <connector> <tool> <json object of arguments>] tag, e.g. [CONNECTOR: notion search {\"query\": \"exam plan\"}], and say only a short line like \"checking notion\"; you'll get the result and answer from it. tools marked [needs the user's yes] are asked about first.\n"
+            + connectorManager.toolCatalogForPrompt
+    }
+
+    /// A second, short model call that turns a tool result into a spoken answer.
+    private func answerWithConnectorResult(transcript: String, callDescription: String, toolResult: String) async -> String {
+        let followUpPrompt = """
+        the user said: "\(transcript)"
+        you used: \(callDescription)
+        it returned:
+        \(toolResult.prefix(6000))
+
+        now answer the user in one to three short spoken sentences. plain words: no tags, no markdown, no links read out. if it says the action is waiting for their yes, tell them exactly what will happen and ask them to say yes.
+        """
+        do {
+            let (answerText, _) = try await geminiAPI.analyzeImageStreaming(
+                images: [],
+                systemPrompt: "you're orchestra, the user's voice companion on their mac. your words are spoken aloud." + OrchestraLanguageSettings.replyLanguagePromptLine,
+                userPrompt: followUpPrompt,
+                onTextChunk: { _ in })
+            let cleanedAnswer = answerText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return cleanedAnswer.isEmpty ? "done." : cleanedAnswer
+        } catch {
+            return "i got a result from the connector but couldn't put it into words just now."
+        }
+    }
+
     // MARK: - Captions
 
     struct CaptionLine: Identifiable, Equatable {
@@ -859,6 +893,20 @@ final class CompanionManager: ObservableObject {
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
+            // A connector action waiting for the user's yes: this turn answers it.
+            if MCPConnectorManager.shared.pendingRiskyCall != nil {
+                if transcript.range(of: MCPConnectorManager.spokenConfirmationPattern, options: [.regularExpression, .caseInsensitive]) != nil {
+                    let toolResult = await MCPConnectorManager.shared.runPendingRiskyCall(afterUserSaid: transcript)
+                    let spokenAnswer = await answerWithConnectorResult(transcript: transcript, callDescription: "the action the user just confirmed", toolResult: toolResult)
+                    guard !Task.isCancelled else { return }
+                    showCaptionLine(isUserSpeech: false, fullText: spokenAnswer)
+                    try? await speechOutputClient.speakText(spokenAnswer)
+                    voiceState = .responding
+                    return
+                }
+                MCPConnectorManager.shared.cancelPendingRiskyCall()
+            }
+
             do {
                 // Capture all connected screens so the AI has full context —
                 // unless the user's screen-sharing setting says not to for this question.
@@ -889,6 +937,7 @@ final class CompanionManager: ObservableObject {
                     + orchestraJobManager.recentJobsSummaryForPrompt()
                     + "\n\nrepeating routines:\n"
                     + orchestraJobManager.routinesSummaryForPrompt()
+                    + Self.connectorPromptSection
                     + (isScreenShared ? "" : "\n\nscreen sharing is OFF for this question: you cannot see the user's screen. don't point, draw, click or take over; if the user needs you to look, tell them to say \"look at my screen\" (or turn screen sharing on in the orchestra menu).")
 
                 let firstReply = try await geminiAPI.analyzeImageStreaming(
@@ -927,6 +976,10 @@ final class CompanionManager: ObservableObject {
                 let takeoverParseResult = Self.extractTagContent(named: "TAKEOVER", from: fullResponseText)
                 fullResponseText = takeoverParseResult.remainingText
 
+                // [CONNECTOR: name tool {json}] = use one of the user's custom connectors.
+                let connectorParseResult = ConnectorTagParser.extractConnectorCall(from: fullResponseText)
+                fullResponseText = connectorParseResult.remainingText
+
                 // [SHOWME: goal] = the user wants to learn it: guide them step by step.
                 let showMeParseResult = Self.extractTagContent(named: "SHOWME", from: fullResponseText)
                 fullResponseText = showMeParseResult.remainingText
@@ -963,6 +1016,19 @@ final class CompanionManager: ObservableObject {
                 }
                 let parseResult = Self.parsePointingCoordinates(from: drawParseResult.remainingText)
                 var spokenText = parseResult.spokenText
+
+                // Run the connector tool, then answer with what it returned.
+                if let connectorCall = connectorParseResult.call {
+                    let toolResult = await MCPConnectorManager.shared.runTool(
+                        connectorIdentifier: connectorCall.connectorIdentifier,
+                        toolName: connectorCall.toolName,
+                        argumentsJSONText: connectorCall.argumentsJSONText)
+                    guard !Task.isCancelled else { return }
+                    spokenText = await answerWithConnectorResult(
+                        transcript: transcript,
+                        callDescription: "\(connectorCall.connectorIdentifier) \(connectorCall.toolName) \(connectorCall.argumentsJSONText)",
+                        toolResult: toolResult)
+                }
 
                 if let macJobBrief = macJobParseResult.tagContent {
                     orchestraJobManager.startJob(brief: macJobBrief, spokenRequest: transcript, place: .mac)
@@ -1212,6 +1278,9 @@ final class CompanionManager: ObservableObject {
 
         let liveSystemInstruction = Self.liveVoiceSystemPrompt
             + Self.userNamePromptLine
+            + (MCPConnectorManager.shared.hasUsableTools
+               ? "\n\nthe user's connected apps — call them with connector_tool (connector, tool, arguments_json). tools marked [needs the user's yes] get parked: tell the user what will happen, and after they say yes call confirm_connector_action.\n" + MCPConnectorManager.shared.toolCatalogForPrompt
+               : "")
             + "\n\nrecent jobs (newest first):\n" + orchestraJobManager.recentJobsSummaryForPrompt()
             + "\n\nrepeating routines:\n" + orchestraJobManager.routinesSummaryForPrompt()
             + (ScreenSharingMode.current == .always

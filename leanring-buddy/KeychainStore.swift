@@ -44,6 +44,23 @@ enum KeychainStore {
             .appendingPathComponent("secrets.json")
     }
 
+    // MARK: - Free-form secrets (e.g. one token per custom MCP connector)
+
+    static func readCustomSecret(named secretName: String) -> String? {
+        secretsLock.lock(); defer { secretsLock.unlock() }
+        let savedValue = loadSecretsLocked()["custom:" + secretName]
+        return (savedValue?.isEmpty == false) ? savedValue : nil
+    }
+
+    @discardableResult
+    static func writeCustomSecret(_ value: String, named secretName: String) -> Bool {
+        secretsLock.lock(); defer { secretsLock.unlock() }
+        var secrets = loadSecretsLocked()
+        let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        secrets["custom:" + secretName] = trimmedValue.isEmpty ? nil : trimmedValue
+        return saveSecretsLocked(secrets)
+    }
+
     static func read(_ key: Key) -> String? {
         secretsLock.lock()
         var secrets = loadSecretsLocked()
