@@ -443,7 +443,7 @@ final class GeminiLiveSession: NSObject {
             let userSpeechAfterParking = timedUserSpeechChunks
                 .filter { $0.heardDate > parkedDate }
                 .map { $0.text }
-                .joined()
+                .joined(separator: " ")
             return await MCPConnectorManager.shared.runPendingRiskyCall(
                 userSpeechAfterParking: userSpeechAfterParking,
                 expectedToolName: arguments["tool"] as? String)

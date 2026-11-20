@@ -182,7 +182,7 @@ final class MCPConnectorManager: ObservableObject {
 
     /// Verbs that change things. Matched against the tool name split into
     /// words (send_email, sendMessage and SendMessage all become "send message").
-    private nonisolated static let riskyToolVerbPattern = #"\b(send|delete|del|remove|rm|destroy|trash|post|publish|pay|payment|transfer|purchase|buy|order|book|refund|charge|invite|share|merge|deploy|reply|forward|archive|cancel|revoke|upload|move|rename|update|edit|modify|write|create|add|insert|set|put|patch|submit|approve|close|kill|drop|overwrite|unsubscribe|block|schedule|comment|like|follow)\b"#
+    private nonisolated static let riskyToolVerbPattern = #"\b(send|delete|del|remove|rm|destroy|trash|post|publish|pay|payment|transfer|purchase|buy|order|book|refund|charge|invite|share|merge|deploy|reply|forward|archive|cancel|revoke|upload|move|rename|update|edit|modify|write|create|add|insert|set|put|patch|submit|approve|close|kill|drop|overwrite|unsubscribe|block|schedule|comment|like|follow|purge|wipe|clear|erase|reset|terminate|logout|revert|restore|empty|execute|exec|run)\b"#
     /// A tool counts as harmless only if it starts with one of these (or the
     /// server marks it read-only) and has no risky verb anywhere in its name.
     private nonisolated static let readOnlyToolVerbPattern = #"^(get|list|search|read|fetch|find|query|describe|lookup|look|view|show|check|count|retrieve|browse|preview)\b"#
@@ -197,7 +197,9 @@ final class MCPConnectorManager: ObservableObject {
             .trimmingCharacters(in: .whitespaces)
         let negationPattern = #"\b(no|nope|nah|not|don't|dont|do not|never|wait|stop|cancel|hold on|hang on|later|actually|but)\b"#
         guard normalizedSpeech.range(of: negationPattern, options: .regularExpression) == nil else { return false }
-        let affirmativeStartPattern = #"^(yes|yeah|yep|yup|sure|ok|okay|confirm|confirmed|go ahead|do it|please do|send it|correct|right)\b"#
+        // A short reply only: "okay so what time is the meeting" isn't a yes.
+        guard normalizedSpeech.split(separator: " ").count <= 6 else { return false }
+        let affirmativeStartPattern = #"^(yes|yeah|yep|yup|sure|ok|okay|confirm|confirmed|go ahead|do it|please do|send it|correct)\b"#
         return normalizedSpeech.range(of: affirmativeStartPattern, options: .regularExpression) != nil
     }
 
@@ -367,8 +369,10 @@ final class MCPConnectorManager: ObservableObject {
             self.pendingRiskyCall = nil
             return "nothing is waiting for a yes (or it expired). ask for it again."
         }
-        if let expectedToolName, !expectedToolName.isEmpty, expectedToolName != pendingRiskyCall.toolName {
-            return "the action waiting for a yes is \(pendingRiskyCall.toolName), not \(expectedToolName). tell the user what's waiting and ask again."
+        // The model may say "connector.tool"; compare the tool part only.
+        let expectedBareToolName = expectedToolName?.split(separator: ".").last.map(String.init) ?? ""
+        if !expectedBareToolName.isEmpty, expectedBareToolName != pendingRiskyCall.toolName {
+            return "the action waiting for a yes is \(pendingRiskyCall.toolName), not \(expectedBareToolName). tell the user what's waiting and ask again."
         }
         guard Self.userSpeechConfirms(userSpeech) else {
             return "the user hasn't clearly said yes (a yes has to come after you asked, with no 'no', 'wait' or 'not'). ask them, and only confirm after they do."

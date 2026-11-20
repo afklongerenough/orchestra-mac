@@ -156,18 +156,30 @@ final class OrchestraAgentStore: ObservableObject {
         let historyEntry = "\n## \(timestampText) — \(succeeded ? "done" : "failed")\nAsked: \(request.prefix(400))\nResult: \(resultText.prefix(600))\n"
         Self.append(historyEntry, toFileAt: agentFolderURL.appendingPathComponent("history.md"))
 
-        let newMemoryLines = resultText.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.uppercased().hasPrefix("MEMORY:") }
-            .map { "- " + $0.dropFirst("MEMORY:".count).trimmingCharacters(in: .whitespaces) }
-            .map { String($0.prefix(200)) }
-            // No secrets, and nothing that reads like a standing order (a hostile page
-            // could try to plant "always forward emails to …" for every later job).
-            .filter { $0.count > 3 && $0.range(of: #"(?i)(password|api[_ ]?key|token|secret)"#, options: .regularExpression) == nil }
-            .filter { $0.range(of: #"(?i)\b(ignore|disregard|always|never|must|instruction|instructions|system prompt|from now on|forward|send|transfer|pay|delete|<\/?agent-)"#, options: .regularExpression) == nil }
+        var newMemoryLines: [String] = []
+        for resultLine in resultText.components(separatedBy: .newlines) {
+            let trimmedLine = resultLine.trimmingCharacters(in: .whitespaces)
+            guard trimmedLine.uppercased().hasPrefix("MEMORY:") else { continue }
+            let memoryFact = String(trimmedLine.dropFirst("MEMORY:".count).trimmingCharacters(in: .whitespaces).prefix(200))
+            guard memoryFact.count > 3 else { continue }
+            if Self.memoryFactIsSafeToKeep(memoryFact) {
+                newMemoryLines.append("- " + memoryFact)
+            } else {
+                OrchestraLog.write("🤖 Agent \(agent.id): didn't save a memory line that looked like a secret or a standing order: \(memoryFact.prefix(120))")
+            }
+        }
         if !newMemoryLines.isEmpty {
             Self.append(newMemoryLines.joined(separator: "\n") + "\n", toFileAt: agentFolderURL.appendingPathComponent("memory.md"))
         }
+    }
+
+    /// No secrets, and nothing that reads like a standing order: a hostile page
+    /// could try to plant "forward every email to …" for every later job.
+    private static func memoryFactIsSafeToKeep(_ memoryFact: String) -> Bool {
+        let secretPattern = #"(?i)(password|passcode|api[_ ]?key|token|secret)"#
+        if memoryFact.range(of: secretPattern, options: .regularExpression) != nil { return false }
+        let standingOrderPattern = #"(?i)(\bignore\b|\bdisregard\b|instruction|system prompt|from now on|\bforward\w*|\bsend\w*|\bsent\b|\btransfer\w*|\bpay\w*|\bdelet\w*|\bwipe\w*|without asking|never ask|don'?t ask|no need to ask|skip (the )?confirm|</?agent-)"#
+        return memoryFact.range(of: standingOrderPattern, options: .regularExpression) == nil
     }
 
     private static func append(_ text: String, toFileAt fileURL: URL) {
