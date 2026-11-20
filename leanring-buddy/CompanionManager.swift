@@ -955,8 +955,9 @@ final class CompanionManager: ObservableObject {
 
             // A connector action waiting for the user's yes: this turn answers it.
             if MCPConnectorManager.shared.pendingRiskyCall != nil {
-                if transcript.range(of: MCPConnectorManager.spokenConfirmationPattern, options: [.regularExpression, .caseInsensitive]) != nil {
-                    let toolResult = await MCPConnectorManager.shared.runPendingRiskyCall(afterUserSaid: transcript)
+                // This whole push-to-talk turn came after the ask, so it's the answer.
+                if MCPConnectorManager.userSpeechConfirms(transcript) {
+                    let toolResult = await MCPConnectorManager.shared.runPendingRiskyCall(userSpeechAfterParking: transcript)
                     let spokenAnswer = await answerWithConnectorResult(transcript: transcript, callDescription: "the action the user just confirmed", toolResult: toolResult)
                     guard !Task.isCancelled else { return }
                     showCaptionLine(isUserSpeech: false, fullText: spokenAnswer)

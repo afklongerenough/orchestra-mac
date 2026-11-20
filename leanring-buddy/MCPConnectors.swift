@@ -16,6 +16,7 @@
 //  are supported for now; "sign in with…" (OAuth) servers aren't yet.
 //
 
+import Combine
 import Foundation
 
 struct MCPConnectorConfig: Codable, Identifiable, Equatable {
@@ -179,9 +180,26 @@ final class MCPConnectorManager: ObservableObject {
     private static let connectorsDefaultsKey = "mcpConnectors"
     private var clientsByConnector: [String: MCPHTTPClient] = [:]
 
-    private nonisolated static let riskyToolNamePattern = #"(^|[_\-.\s])(send|delete|remove|destroy|trash|post|publish|pay|payment|transfer|purchase|buy|refund|charge|invite|share|merge|deploy|reply|forward|archive|cancel|revoke)([_\-.\s]|$)"#
-    /// What counts as the user saying yes to a parked action.
-    nonisolated static let spokenConfirmationPattern = #"\b(yes|yeah|yep|yup|sure|do it|go ahead|confirm|confirmed|okay do it|ok do it|send it|please do)\b"#
+    /// Verbs that change things. Matched against the tool name split into
+    /// words (send_email, sendMessage and SendMessage all become "send message").
+    private nonisolated static let riskyToolVerbPattern = #"\b(send|delete|del|remove|rm|destroy|trash|post|publish|pay|payment|transfer|purchase|buy|order|book|refund|charge|invite|share|merge|deploy|reply|forward|archive|cancel|revoke|upload|move|rename|update|edit|modify|write|create|add|insert|set|put|patch|submit|approve|close|kill|drop|overwrite|unsubscribe|block|schedule|comment|like|follow)\b"#
+    /// A tool counts as harmless only if it starts with one of these (or the
+    /// server marks it read-only) and has no risky verb anywhere in its name.
+    private nonisolated static let readOnlyToolVerbPattern = #"^(get|list|search|read|fetch|find|query|describe|lookup|look|view|show|check|count|retrieve|browse|preview)\b"#
+
+    /// True only for a clear yes: it has to START with yes/sure/go ahead…, and
+    /// any no/not/don't/wait/stop anywhere in it turns it into a no.
+    nonisolated static func userSpeechConfirms(_ userSpeech: String) -> Bool {
+        let normalizedSpeech = userSpeech.lowercased()
+            .replacingOccurrences(of: "’", with: "'")
+            .replacingOccurrences(of: #"[^a-z' ]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        let negationPattern = #"\b(no|nope|nah|not|don't|dont|do not|never|wait|stop|cancel|hold on|hang on|later|actually|but)\b"#
+        guard normalizedSpeech.range(of: negationPattern, options: .regularExpression) == nil else { return false }
+        let affirmativeStartPattern = #"^(yes|yeah|yep|yup|sure|ok|okay|confirm|confirmed|go ahead|do it|please do|send it|correct|right)\b"#
+        return normalizedSpeech.range(of: affirmativeStartPattern, options: .regularExpression) != nil
+    }
 
     private init() {
         if let savedData = UserDefaults.standard.data(forKey: Self.connectorsDefaultsKey),
@@ -279,11 +297,21 @@ final class MCPConnectorManager: ObservableObject {
         let annotations = rawTool["annotations"] as? [String: Any] ?? [:]
         let isMarkedReadOnly = (annotations["readOnlyHint"] as? Bool) == true
         let isMarkedDestructive = (annotations["destructiveHint"] as? Bool) == true
-        let nameSoundsRisky = toolName.lowercased().range(of: riskyToolNamePattern, options: .regularExpression) != nil
+        // "sendMessage" / "SendMessage" / "send-message" → "send message"
+        let toolNameWords = toolName
+            .replacingOccurrences(of: #"([a-z0-9])([A-Z])"#, with: "$1 $2", options: .regularExpression)
+            .replacingOccurrences(of: #"[_\-.\s/:]+"#, with: " ", options: .regularExpression)
+            .lowercased()
+            .trimmingCharacters(in: .whitespaces)
+        let nameSoundsRisky = toolNameWords.range(of: riskyToolVerbPattern, options: .regularExpression) != nil
+        let nameSoundsReadOnly = toolNameWords.range(of: readOnlyToolVerbPattern, options: .regularExpression) != nil
+        // A server's readOnlyHint never overrides a risky-sounding name; anything
+        // that isn't clearly a read needs the user's yes.
+        let isRisky = isMarkedDestructive || nameSoundsRisky || !(isMarkedReadOnly || nameSoundsReadOnly)
         return MCPToolInfo(name: toolName,
                            description: String(toolDescription.prefix(140)),
                            argumentSummary: argumentSummary,
-                           isRisky: isMarkedDestructive || (nameSoundsRisky && !isMarkedReadOnly))
+                           isRisky: isRisky)
     }
 
     // MARK: - For the models
@@ -318,22 +346,32 @@ final class MCPConnectorManager: ObservableObject {
             return "arguments must be a JSON object, e.g. {\"query\": \"...\"}"
         }
         if toolInfo.isRisky {
+            // Only one action waits at a time; a new one replaces the old, and only a
+            // yes said after this moment counts (see runPendingRiskyCall).
+            if let replacedCall = pendingRiskyCall {
+                OrchestraLog.write("🔌 Dropped the earlier parked \(replacedCall.toolName) for \(toolName)")
+            }
             pendingRiskyCall = PendingConnectorCall(connectorIdentifier: connectorIdentifier, toolName: toolName,
                                                     arguments: parsedArguments, createdDate: Date())
             OrchestraLog.write("🔌 Parked for the user's yes: \(connectorIdentifier).\(toolName)")
-            return "not run yet: \(toolName) changes things for other people or can't be undone. tell the user exactly what it will do (\(Self.compactJSON(parsedArguments).prefix(200))) and ask them to say yes. it runs only after they confirm."
+            return "not run yet: \(toolName) may change things. tell the user exactly what it will do (\(Self.compactJSON(parsedArguments).prefix(200))) and ask them to say yes. it runs only after they confirm, and only this one action (any earlier waiting action was dropped)."
         }
         return await execute(connectorIdentifier: connectorIdentifier, toolName: toolName, arguments: parsedArguments)
     }
 
     /// Runs the parked action if the user really said yes within 2 minutes.
-    func runPendingRiskyCall(afterUserSaid userSpeech: String) async -> String {
+    /// `userSpeechAfterParking` must hold only what the user said AFTER the
+    /// action was parked; `expectedToolName` (when given) must match it.
+    func runPendingRiskyCall(userSpeechAfterParking userSpeech: String, expectedToolName: String? = nil) async -> String {
         guard let pendingRiskyCall, Date().timeIntervalSince(pendingRiskyCall.createdDate) < 120 else {
             self.pendingRiskyCall = nil
             return "nothing is waiting for a yes (or it expired). ask for it again."
         }
-        guard userSpeech.range(of: Self.spokenConfirmationPattern, options: [.regularExpression, .caseInsensitive]) != nil else {
-            return "the user hasn't said yes yet. ask them, and only confirm after they do."
+        if let expectedToolName, !expectedToolName.isEmpty, expectedToolName != pendingRiskyCall.toolName {
+            return "the action waiting for a yes is \(pendingRiskyCall.toolName), not \(expectedToolName). tell the user what's waiting and ask again."
+        }
+        guard Self.userSpeechConfirms(userSpeech) else {
+            return "the user hasn't clearly said yes (a yes has to come after you asked, with no 'no', 'wait' or 'not'). ask them, and only confirm after they do."
         }
         self.pendingRiskyCall = nil
         OrchestraLog.write("🔌 User confirmed: \(pendingRiskyCall.connectorIdentifier).\(pendingRiskyCall.toolName)")

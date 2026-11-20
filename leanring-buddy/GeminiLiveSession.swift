@@ -96,6 +96,9 @@ final class GeminiLiveSession: NSObject {
     /// What the user has said recently (from Live's input transcription), used to
     /// decide whether "only when asked" allows a look at the screen.
     private var recentUserSpeechText = ""
+    /// What the user said in the last two minutes, chunk by chunk with times,
+    /// so a connector "yes" can be checked against speech after the ask only.
+    private var timedUserSpeechChunks: [(heardDate: Date, text: String)] = []
     private var lastUserSpeechDate = Date.distantPast
     private var sessionStartDate = Date()
 
@@ -265,8 +268,8 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "confirm_connector_action",
-            "description": "Run the parked connector action, only right after the user clearly said yes to it.",
-            "parameters": stringParameters([], required: [])
+            "description": "Run the parked connector action, only right after the user clearly said yes to it. tool = the parked tool's name.",
+            "parameters": stringParameters(["tool"], required: ["tool"])
         ],
         [
             "name": "stop_screen_takeover",
@@ -350,6 +353,8 @@ final class GeminiLiveSession: NSObject {
                 }
                 lastUserSpeechDate = Date()
                 recentUserSpeechText = String((recentUserSpeechText + " " + spokenText).suffix(400))
+                timedUserSpeechChunks.append((heardDate: Date(), text: spokenText))
+                timedUserSpeechChunks.removeAll { Date().timeIntervalSince($0.heardDate) > 130 }
                 onTranscription?(true, spokenText)
             }
             if let outputTranscription = serverContent["outputTranscription"] as? [String: Any],
@@ -432,7 +437,16 @@ final class GeminiLiveSession: NSObject {
                 argumentsJSONText: arguments["arguments_json"] as? String ?? "{}")
         case "confirm_connector_action":
             // Checked against what the user actually said, not the model's word.
-            return await MCPConnectorManager.shared.runPendingRiskyCall(afterUserSaid: recentUserSpeechText)
+            guard let parkedDate = MCPConnectorManager.shared.pendingRiskyCall?.createdDate else {
+                return "nothing is waiting for a yes."
+            }
+            let userSpeechAfterParking = timedUserSpeechChunks
+                .filter { $0.heardDate > parkedDate }
+                .map { $0.text }
+                .joined()
+            return await MCPConnectorManager.shared.runPendingRiskyCall(
+                userSpeechAfterParking: userSpeechAfterParking,
+                expectedToolName: arguments["tool"] as? String)
         case "show_me_how":
             return toolHandlers.showMeHow(arguments["goal"] as? String ?? "")
         case "browser":
