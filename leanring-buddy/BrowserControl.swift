@@ -201,7 +201,7 @@ enum BrowserControl {
         let fileValues = try? URL(fileURLWithPath: resolvedPath).resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
         guard fileValues?.isRegularFile == true else { throw BrowserError(message: "there's no file at \(resolvedPath)") }
         let maximumUploadBytes = 200 * 1024 * 1024
-        guard (fileValues?.fileSize ?? 0) <= maximumUploadBytes else { throw BrowserError(message: "that file is over 200 MB; the user should attach it themselves") }
+        guard let fileSize = fileValues?.fileSize, fileSize <= maximumUploadBytes else { throw BrowserError(message: "couldn't check that file's size, or it's over 200 MB; the user should attach it themselves") }
         return try await extensionBridge.send(["action": "upload", "elementId": elementIdentifier, "path": resolvedPath])
     }
 

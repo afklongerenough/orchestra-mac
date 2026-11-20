@@ -18,12 +18,15 @@ import Foundation
 enum ChromeExtensionFiles {
     static let extensionIdentifier = "ahfdnphbhdjokpkecfbhdhpcoldpogfh"
     static let bridgePort: UInt16 = 43823
+    /// Sent in the hello; bump it whenever background.js changes so Orchestra can
+    /// tell the user to reload an extension still running old code.
+    static let extensionCodeVersion = 2
 
     static let manifestJSON = """
     {
       "manifest_version": 3,
       "name": "Orchestra",
-      "version": "1.0",
+      "version": "1.2",
       "description": "Lets the Orchestra Mac app read and use the page in your active tab when you ask it to.",
       "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqo8hwIsewI0ND+G0Fh+KARt4KlovPG+ID3a1jY/L4pYKG5d8Z4vpwjum4VP1CLzDr3MxLEMMKzm8mf9sx84eyMS7W0Da7RlTTtFwVtb+0ASYb15mFckQtv8qBBu9p7iAPloBxY4f7KqEInISVZTruX0leNkp4x3bkP0XX1Kp/M8ISpTqByiJ7PCdDT6+UDGMnrLs464/8VJOvITCWLnlYjyiSA85TcUoio8OTmUHQmIEGHg9qOf9JdFgzhUFSZT0pFwTBUN8atibMLTHOESNmVId+QyZbeIdBP8Qv/XCsmI4SzI8nB5pexY4K8JxScPT2x7pX1MXoOb8SJ3j6QgjYwIDAQAB",
       "permissions": ["scripting", "tabs", "debugger", "alarms"],
@@ -52,7 +55,7 @@ enum ChromeExtensionFiles {
         return;
       }
       orchestraSocket.onopen = () => {
-        orchestraSocket.send(JSON.stringify({ type: 'hello', token: ORCHESTRA_TOKEN, version: 1 }));
+        orchestraSocket.send(JSON.stringify({ type: 'hello', token: ORCHESTRA_TOKEN, version: 2 }));
       };
       orchestraSocket.onmessage = async (event) => {
         let message;
@@ -173,6 +176,8 @@ enum ChromeExtensionFiles {
       return 'page: ' + document.title + '\naddress: ' + location.href + '\n\nelements:\n' + lines.join('\n') + '\n\npage text:\n' + pageText;
     }
 
+    // SAFETY: describeElementInTab and clickElementInTab must build the label the
+    // same way (the Mac checks the first, the page compares it in the second).
     function describeElementInTab(elementId) {
       function orchestraLabel(node, maximumLength) {
         const isButtonLikeInput = node.tagName === 'INPUT' && /^(button|submit|reset)$/i.test(node.type || '');
@@ -206,7 +211,9 @@ enum ChromeExtensionFiles {
       const fullLabel = orchestraLabel(node, 2000);
       const visibleText = (node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 2000);
       const currentLabel = (fullLabel + (visibleText && fullLabel.indexOf(visibleText) < 0 ? ' ' + visibleText : '')) || '(no label)';
-      if (currentLabel !== expectedLabel) return 'changed';
+      // Counters, prices and timestamps tick: compare without digits, first 200 chars.
+      const comparable = (text) => text.replace(/\d+/g, '#').slice(0, 200);
+      if (comparable(currentLabel) !== comparable(expectedLabel)) return 'changed';
       node.scrollIntoView({ block: 'center' });
       node.focus();
       node.click();
