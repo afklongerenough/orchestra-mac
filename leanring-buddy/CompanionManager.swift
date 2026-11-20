@@ -699,6 +699,17 @@ final class CompanionManager: ObservableObject {
             + OrchestraLanguageSettings.replyLanguagePromptLine
     }
 
+    // MARK: - Agent roster
+
+    private static var agentRosterPromptSection: String {
+        """
+
+        the user's named agents (they keep their own memory, folder and history):
+        \(OrchestraAgentStore.shared.rosterForPrompt)
+        when a request belongs to one of them, use [AGENT: <name> | <brief that stands on its own>] instead of [JOB:]/[MACJOB:]. when the user asks you to make a new agent ("make me a study agent for cmpt 201"), add [NEW_AGENT: <short name> | <purpose in their words> | hermes or mac] and confirm in one line.
+        """
+    }
+
     // MARK: - Custom connectors
 
     /// Tells the push-to-talk brain which connector tools exist.
@@ -938,6 +949,7 @@ final class CompanionManager: ObservableObject {
                     + "\n\nrepeating routines:\n"
                     + orchestraJobManager.routinesSummaryForPrompt()
                     + Self.connectorPromptSection
+                    + Self.agentRosterPromptSection
                     + (isScreenShared ? "" : "\n\nscreen sharing is OFF for this question: you cannot see the user's screen. don't point, draw, click or take over; if the user needs you to look, tell them to say \"look at my screen\" (or turn screen sharing on in the orchestra menu).")
 
                 let firstReply = try await geminiAPI.analyzeImageStreaming(
@@ -994,6 +1006,29 @@ final class CompanionManager: ObservableObject {
                         place: .hermes,
                         isQuickLook: true
                     )
+                }
+
+                // [NEW_AGENT: name | purpose | hermes or mac] = add a named agent to the roster.
+                let newAgentParseResult = Self.extractTagContent(named: "NEW_AGENT", from: fullResponseText)
+                fullResponseText = newAgentParseResult.remainingText
+                if let newAgentText = newAgentParseResult.tagContent {
+                    let newAgentPieces = newAgentText.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+                    if newAgentPieces.count >= 2 {
+                        let newAgentPlace: OrchestraJobPlace = newAgentPieces.count >= 3 && newAgentPieces[2].lowercased() == "mac" ? .mac : .hermes
+                        OrchestraAgentStore.shared.createAgent(displayName: newAgentPieces[0], purpose: newAgentPieces[1], place: newAgentPlace)
+                    }
+                }
+
+                // [AGENT: name | brief] = a job for one of the user's named agents.
+                let agentJobParseResult = Self.extractTagContent(named: "AGENT", from: fullResponseText)
+                fullResponseText = agentJobParseResult.remainingText
+                if let agentJobText = agentJobParseResult.tagContent {
+                    let agentJobPieces = agentJobText.components(separatedBy: "|")
+                    if agentJobPieces.count >= 2,
+                       let namedAgent = OrchestraAgentStore.shared.agent(named: agentJobPieces[0].trimmingCharacters(in: .whitespaces)) {
+                        let agentBrief = agentJobPieces.dropFirst().joined(separator: "|").trimmingCharacters(in: .whitespaces)
+                        orchestraJobManager.startJob(brief: agentBrief, spokenRequest: transcript, place: namedAgent.place, agentIdentifier: namedAgent.id)
+                    }
                 }
 
                 // [MACJOB: brief] = background job for the on-Mac agent.
@@ -1278,6 +1313,7 @@ final class CompanionManager: ObservableObject {
 
         let liveSystemInstruction = Self.liveVoiceSystemPrompt
             + Self.userNamePromptLine
+            + "\n\nthe user's named agents (pass agent=<name> to start_job when a request belongs to one; create_agent makes a new one):\n" + OrchestraAgentStore.shared.rosterForPrompt
             + (MCPConnectorManager.shared.hasUsableTools
                ? "\n\nthe user's connected apps — call them with connector_tool (connector, tool, arguments_json). tools marked [needs the user's yes] get parked: tell the user what will happen, and after they say yes call confirm_connector_action.\n" + MCPConnectorManager.shared.toolCatalogForPrompt
                : "")
@@ -1309,13 +1345,24 @@ final class CompanionManager: ObservableObject {
                 // Pass along what really happened (e.g. which song is playing) so the voice says the truth.
                 return result.succeeded ? "done\(result.detail.map { ": \($0)" } ?? "")" : "failed: \(result.detail ?? "error")"
             },
-            startJob: { [weak self] place, brief in
+            startJob: { [weak self] requestedPlace, brief, agentName in
                 guard let self else { return "not available" }
+                let namedAgent = agentName.flatMap { OrchestraAgentStore.shared.agent(named: $0) }
+                if agentName != nil && namedAgent == nil {
+                    return "there's no agent called \(agentName ?? ""). agents: \(OrchestraAgentStore.shared.activeAgents.map(\.id).joined(separator: ", ")). create it first with create_agent if the user wants one."
+                }
+                let place = namedAgent?.place ?? requestedPlace
                 if place == .hermes && !HermesBridgeClient.isConfigured {
                     return "hermes isn't connected yet; tell the user to paste the hermes token under connections"
                 }
-                let job = self.orchestraJobManager.startJob(brief: brief, spokenRequest: brief, place: place)
+                let job = self.orchestraJobManager.startJob(brief: brief, spokenRequest: brief, place: place, agentIdentifier: namedAgent?.id)
                 return "started job \"\(job.title)\" on \(place.rawValue). The user will be told when it's done."
+            },
+            createAgent: { name, purpose, place in
+                guard let createdAgent = OrchestraAgentStore.shared.createAgent(displayName: name, purpose: purpose, place: place) else {
+                    return "couldn't make that agent; it needs a short name"
+                }
+                return "agent \"\(createdAgent.id)\" is ready (works on \(createdAgent.place.rawValue)). jobs for it remember what it learns."
             },
             takeOverScreen: { [weak self] goal in
                 guard let self else { return "not available" }

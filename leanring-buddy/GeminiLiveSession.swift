@@ -35,7 +35,8 @@ final class GeminiLiveSession: NSObject {
         /// (x, y) on a 0–1000 grid over the latest screen frame → points the blue cursor.
         let pointAt: (_ normalizedX: Double, _ normalizedY: Double, _ label: String, _ screenCapture: CompanionScreenCapture) -> Void
         let runMacAction: (_ action: String) async -> String
-        let startJob: (_ place: OrchestraJobPlace, _ brief: String) -> String
+        let startJob: (_ place: OrchestraJobPlace, _ brief: String, _ agentName: String?) -> String
+        let createAgent: (_ name: String, _ purpose: String, _ place: OrchestraJobPlace) -> String
         let takeOverScreen: (_ goal: String) -> String
         let showMeHow: (_ goal: String) -> String
         let runBrowserAction: (_ action: String, _ elementIdentifier: Int?, _ text: String) -> String
@@ -224,8 +225,13 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "start_job",
-            "description": "Start a background job. place='hermes' for research, the user's accounts (email, calendar, files, notes, reminders), the web, github. place='mac' for work on this Mac's files and apps. The brief must stand on its own.",
-            "parameters": stringParameters(["place", "brief"], required: ["place", "brief"])
+            "description": "Start a background job. place='hermes' for research, the user's accounts (email, calendar, files, notes, reminders), the web, github. place='mac' for work on this Mac's files and apps. agent = one of the user's named agents (from your instructions) when the request belongs to it; it then uses that agent's memory, and its usual place. The brief must stand on its own.",
+            "parameters": stringParameters(["place", "brief", "agent"], required: ["brief"])
+        ],
+        [
+            "name": "create_agent",
+            "description": "Create a named agent the user wants to keep (e.g. 'make me a study agent for cmpt 201'). name = short name, purpose = what it's for in the user's words, place = 'hermes' or 'mac'.",
+            "parameters": stringParameters(["name", "purpose", "place"], required: ["name", "purpose"])
         ],
         [
             "name": "take_over_screen",
@@ -407,7 +413,11 @@ final class GeminiLiveSession: NSObject {
             return await toolHandlers.runMacAction(arguments["action"] as? String ?? "")
         case "start_job":
             let place: OrchestraJobPlace = (arguments["place"] as? String)?.lowercased() == "mac" ? .mac : .hermes
-            return toolHandlers.startJob(place, arguments["brief"] as? String ?? "")
+            let agentName = (arguments["agent"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return toolHandlers.startJob(place, arguments["brief"] as? String ?? "", agentName)
+        case "create_agent":
+            let place: OrchestraJobPlace = (arguments["place"] as? String)?.lowercased() == "mac" ? .mac : .hermes
+            return toolHandlers.createAgent(arguments["name"] as? String ?? "", arguments["purpose"] as? String ?? "", place)
         case "take_over_screen":
             return toolHandlers.takeOverScreen(arguments["goal"] as? String ?? "")
         case "stop_screen_takeover":

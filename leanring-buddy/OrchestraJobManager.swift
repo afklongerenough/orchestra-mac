@@ -45,6 +45,8 @@ struct OrchestraJob: Codable, Identifiable, Equatable {
     var routineIdentifier: String?
     /// Quick looks speak Hermes's answer itself instead of "your job is done".
     var isQuickLook: Bool?
+    /// The named agent (roster) doing this job, if any.
+    var agentIdentifier: String?
 
     var folderURL: URL { URL(fileURLWithPath: folderPath, isDirectory: true) }
     var noteFileURL: URL { folderURL.appendingPathComponent("note.md") }
@@ -120,11 +122,15 @@ final class OrchestraJobManager: ObservableObject {
                   spokenRequest: String,
                   place: OrchestraJobPlace = .hermes,
                   routineIdentifier: String? = nil,
-                  isQuickLook: Bool = false) -> OrchestraJob {
+                  isQuickLook: Bool = false,
+                  agentIdentifier: String? = nil) -> OrchestraJob {
+        // A named agent brings its purpose, memory and history along.
+        let assignedAgent = agentIdentifier.flatMap { OrchestraAgentStore.shared.agent(named: $0) }
         let createdAt = Date()
         let jobTitle = isQuickLook
             ? "quick look: " + Self.makeShortTitle(from: brief.components(separatedBy: ": ").dropFirst().joined(separator: ": "))
-            : Self.makeShortTitle(from: brief)
+            : (assignedAgent.map { "\($0.id): " } ?? "") + Self.makeShortTitle(from: brief)
+        let agentAwareBrief = assignedAgent.map { OrchestraAgentStore.shared.contextForJob(of: $0) + "\n\nThis job: " + brief } ?? brief
         let folderName = "\(Self.folderDateFormatter.string(from: createdAt))-\(Self.makeSlug(from: jobTitle))"
         let jobFolderURL = Self.jobsRootFolderURL.appendingPathComponent(folderName, isDirectory: true)
         try? FileManager.default.createDirectory(at: jobFolderURL, withIntermediateDirectories: true)
@@ -132,7 +138,7 @@ final class OrchestraJobManager: ObservableObject {
         let job = OrchestraJob(
             id: folderName,
             title: jobTitle,
-            brief: brief,
+            brief: agentAwareBrief,
             createdAt: createdAt,
             folderPath: jobFolderURL.path,
             hermesTaskIdentifier: nil,
@@ -141,7 +147,8 @@ final class OrchestraJobManager: ObservableObject {
             finishedAt: nil,
             place: place,
             routineIdentifier: routineIdentifier,
-            isQuickLook: isQuickLook
+            isQuickLook: isQuickLook,
+            agentIdentifier: assignedAgent?.id
         )
         jobs.insert(job, at: 0)
         writeBriefAndMemoryFiles(for: job, spokenRequest: spokenRequest)
@@ -252,6 +259,10 @@ final class OrchestraJobManager: ObservableObject {
             job.finishedAt = Date()
         }
         guard let job = jobs.first(where: { $0.id == jobIdentifier }) else { return }
+        if let agentIdentifier = job.agentIdentifier {
+            OrchestraAgentStore.shared.recordFinishedJob(agentIdentifier: agentIdentifier, request: job.title,
+                                                         resultText: resultText, succeeded: succeeded)
+        }
         writeReportFile(for: job)
         writeNoteResult(for: job)
         writeWorkList()

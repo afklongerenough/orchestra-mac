@@ -20,6 +20,7 @@ struct CompanionPanelView: View {
     @AppStorage(OrchestraLanguageSettings.dictationLocaleDefaultsKey) private var dictationLocaleIdentifier: String = ""
     @State private var spotifyAccountStatusText: String = ""
     @ObservedObject private var connectorManager = MCPConnectorManager.shared
+    @ObservedObject private var agentStore = OrchestraAgentStore.shared
     @State private var newConnectorNameInput: String = ""
     @State private var newConnectorURLInput: String = ""
     @State private var newConnectorTokenInput: String = ""
@@ -104,6 +105,10 @@ struct CompanionPanelView: View {
 
                 OrchestraJobsListView(orchestraJobManager: companionManager.orchestraJobManager)
                     .padding(.horizontal, 16)
+
+                agentsSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
 
                 Spacer()
                     .frame(height: 12)
@@ -1062,6 +1067,50 @@ struct CompanionPanelView: View {
             RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                 .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
         )
+    }
+
+    // MARK: - Agent roster
+
+    @ViewBuilder
+    private var agentsSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Agents")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                Text(agentStore.activeAgents.isEmpty ? "say \"make me a study agent\"" : "\(agentStore.activeAgents.count)")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            ForEach(agentStore.activeAgents) { agent in
+                HStack(spacing: 6) {
+                    Image(systemName: agent.place == .mac ? "laptopcomputer" : "cloud")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(agent.displayName)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+                        Text(agent.purpose)
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button("Folder") { agentStore.openFolder(of: agent) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .pointerCursor()
+                    Button("Archive") { agentStore.setArchived(agent, isArchived: true) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .pointerCursor()
+                }
+            }
+        }
     }
 
     // MARK: - Custom connectors (MCP servers)
