@@ -18,5 +18,9 @@
 	<string>Orchestra controls apps like Spotify when you ask it to (play, pause, skip, volume).</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Orchestra uses speech recognition to transcribe your voice when you talk to it</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Orchestra adds reminders you ask for by voice, like "remind me at 5 to study".</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Orchestra adds calendar events you ask for by voice and reads your day when you ask what's on.</string>
 </dict>
 </plist>

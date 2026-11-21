@@ -1,6 +1,16 @@
 # Orchestra (fork of Clicky) - Agent Instructions
 
 > **Orchestra fork notes:** voice answers use **Gemini** (`GeminiAPI.swift`, user's key in the Keychain via `KeychainStore.swift`), speech-to-text is **Apple Speech** (Info.plist `VoiceTranscriptionProvider = apple`), replies are spoken with **macOS voices** (`SpeechOutputClient.swift`). No Cloudflare Worker is used. Bigger requests become **Hermes jobs**: the model emits `[JOB: brief]`, `OrchestraJobManager.swift` makes `~/Orchestra/Jobs/<date>-<slug>/` (brief.md, memory.md, report.md), sends the brief to Hermes through its MCP bridge (`HermesBridgeClient.swift`, JSON-RPC + bearer token) and polls `hermes_task_status`. `OrchestraJobsListView.swift` shows jobs in the panel. PostHog analytics are disabled. Builds run on GitHub Actions (`.github/workflows/build-dmg.yml`, ad-hoc signed DMG) because the local Mac has no Xcode. The sections below describe the original Clicky and are partly outdated.
+>
+> **Connectors:** custom MCP servers (`MCPConnectors.swift`) take a bearer token **or browser sign-in (OAuth)** — `ConnectorOAuth.swift` does RFC 9728/8414 discovery, dynamic client registration and PKCE with a loopback listener on 127.0.0.1:43822 (Notion's hosted server works via the "Add Notion (sign in)" preset). Gmail, Google Calendar and Drive are a built-in **read-only** connector (`GoogleConnector.swift`, the user's own Desktop-app OAuth client, scopes gmail/calendar/drive `.readonly`). Risky connector tools are parked until the user clearly says yes.
+>
+> **Long-term memory:** `OrchestraMemory.swift` keeps durable facts about the user in `~/Orchestra/memory.md`, read into every push-to-talk and Live prompt. The model adds facts with `[REMEMBER: …]` / `remember_fact` and removes them with `[FORGET: …]` / `forget_fact`; a safety filter blocks secrets and standing-order-shaped lines.
+>
+> **Lecture/meeting notes:** `OrchestraNoteTaker.swift` — "take notes on this" (`[NOTES: start]` / `take_notes`) records the mic, transcribes live with Apple Speech, and on stop writes audio.wav + transcript.md + a Gemini-written notes.md to `~/Orchestra/Notes/<session>/` and optionally a folder the user picks (e.g. an Obsidian vault). 2-hour cap; the wake word pauses while recording.
+>
+> **Reminders & Calendar:** `MacCalendarReminders.swift` (EventKit) — `[REMINDER: title | when]`, `[EVENT: title | start | end]`, `[SCHEDULE: day]` tags and `add_reminder` / `add_calendar_event` / `my_schedule` Live tools go straight into Apple Reminders/Calendar, no Hermes. Additive only (no deleting/changing existing items). Info.plist carries `NSRemindersFullAccessUsageDescription` / `NSCalendarsFullAccessUsageDescription`.
+>
+> **Selected-text actions:** `SelectedTextActions.swift` — select text anywhere, hold **shift+control** (a second listen-only CGEvent tap, separate from ctrl+option push-to-talk), say "rewrite this" / "explain this" / "translate", release. The selection is copied on release (clipboard saved and restored), Gemini returns a replacement (pasted back with cmd+V, return never pressed) or a spoken explanation.
 
 
 <!-- This is the single source of truth for all AI coding agents. CLAUDE.md is a symlink to this file. -->
@@ -56,9 +66,9 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `CompanionManager.swift` | ~2302 | Central state machine. Owns dictation, both shortcut monitors (push-to-talk + selected-text), screen capture, the Gemini pipeline, speech output, jobs, and overlay management. Parses and runs every voice tag (JOB, CONNECTOR, REMEMBER, REMINDER, EVENT, SCHEDULE, NOTES, ACTION, POINT, …) and wires the Live-mode tool handlers. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
+| `CompanionPanelView.swift` | ~1637 | SwiftUI panel content for the menu bar dropdown: status, toggles, jobs, agents, memory, notes controls, Connections (keys, connector sign-in, Google) and quit. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
@@ -69,6 +79,14 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
 | `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
+| `MCPConnectors.swift` | ~518 | Custom MCP connectors: add/remove/enable servers, list tools, run them with the risky-tool yes-gate, `[CONNECTOR:]` tag parser. OAuth connectors get fresh access tokens via `ConnectorOAuthManager`. |
+| `ConnectorOAuth.swift` | ~399 | OAuth sign-in for connectors: endpoint discovery, dynamic client registration, PKCE + loopback callback (port 43822), token refresh, per-connector client records and refresh tokens. |
+| `GoogleConnector.swift` | ~438 | Built-in read-only "google" connector: the user's own OAuth Desktop client, Gmail search/read, Calendar events, Drive search/read via Google REST APIs. |
+| `OrchestraMemory.swift` | ~143 | Long-term memory of the user (`~/Orchestra/memory.md`): remember/forget with dedupe and a secrets/standing-order safety filter; prompt section for both voice modes. |
+| `MacCalendarReminders.swift` | ~247 | EventKit bridge: add reminders (with alarm) and calendar events, read a day's schedule; forgiving date parsing for model output. |
+| `OrchestraNoteTaker.swift` | ~421 | Lecture/meeting recorder: AVAudioEngine + Apple Speech segments, WAV + transcript saving, Gemini summary to ~/Orchestra/Notes or a picked folder, 2-hour cap, finished announcement. |
+| `SelectedTextActions.swift` | ~219 | Shift+control shortcut monitor, selection capture with clipboard restore, Gemini rewrite/explain/translate, paste-back (never presses return). |
+| `GeminiLiveSession.swift` | ~881 | Gemini Live two-way voice: websocket protocol, mic echo handling, screen frames, and the Live tool surface (jobs, connectors, reminders/calendar, notes, memory, takeover). |
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |

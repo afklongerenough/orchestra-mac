@@ -27,6 +27,15 @@ struct CompanionPanelView: View {
     @State private var newConnectorTokenInput: String = ""
     @State private var connectorFormMessage: String = ""
     @State private var isConnectingSpotifyAccount = false
+    @ObservedObject private var googleConnectorManager = GoogleConnectorManager.shared
+    @ObservedObject private var connectorOAuthManager = ConnectorOAuthManager.shared
+    @ObservedObject private var memoryStore = OrchestraMemoryStore.shared
+    @ObservedObject private var noteTaker = OrchestraNoteTaker.shared
+    @State private var googleClientIDInput: String = ""
+    @State private var googleClientSecretInput: String = ""
+    @State private var googleAccountStatusText: String = ""
+    @State private var hasGoogleClientCredentialsSaved: Bool = GoogleConnectorManager.shared.hasClientCredentials
+    @State private var connectorSignInStatusText: String = ""
     /// Saved as soon as it's typed (no Save needed).
     @AppStorage("userDisplayName") private var userDisplayNameInput: String = ""
     @State private var hermesBridgeTokenInput: String = ""
@@ -110,6 +119,18 @@ struct CompanionPanelView: View {
                 agentsSection
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
+
+                memoryRow
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+
+                notesSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+
+                selectedTextHintRow
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
 
                 Spacer()
                     .frame(height: 12)
@@ -1022,6 +1043,15 @@ struct CompanionPanelView: View {
                     }
                     spotifyClientIDInput = ""
                     spotifyClientSecretInput = ""
+                    if !googleClientIDInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        KeychainStore.write(googleClientIDInput, for: .googleClientID)
+                    }
+                    if !googleClientSecretInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        KeychainStore.write(googleClientSecretInput, for: .googleClientSecret)
+                    }
+                    googleClientIDInput = ""
+                    googleClientSecretInput = ""
+                    hasGoogleClientCredentialsSaved = GoogleConnectorManager.shared.hasClientCredentials
                     if !openCodeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         KeychainStore.write(openCodeAPIKeyInput, for: .openCodeAPIKey)
                     }
@@ -1115,6 +1145,106 @@ struct CompanionPanelView: View {
         }
     }
 
+    // MARK: - Long-term memory
+
+    private var memoryRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "brain.head.profile")
+                .font(.system(size: 10))
+                .foregroundColor(DS.Colors.textTertiary)
+            Text(memoryStore.facts.isEmpty ? "Memory: nothing yet" : "Memory: \(memoryStore.facts.count) facts")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+            Spacer()
+            Button("Open") { memoryStore.openMemoryFile() }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+                .pointerCursor()
+            Button("Clear") { memoryStore.clearAll() }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Colors.textTertiary)
+                .pointerCursor()
+        }
+    }
+
+    // MARK: - Lecture / meeting notes
+
+    private var notesSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "note.text")
+                    .font(.system(size: 10))
+                    .foregroundColor(noteTaker.isRecording ? DS.Colors.blue400 : DS.Colors.textTertiary)
+                Text(noteTaker.isRecording ? "Taking notes…" : "Notes: say \"take notes on this\"")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Spacer()
+                if noteTaker.isRecording {
+                    Button("Stop") {
+                        Task { _ = await noteTaker.stopNotes() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.accent)
+                    .pointerCursor()
+                } else if noteTaker.statusText == "writing notes…" {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Button("Start") {
+                        Task { _ = await noteTaker.startNotes(topicHint: "") }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .pointerCursor()
+                }
+            }
+            HStack(spacing: 6) {
+                Text("Saved to: \(noteTaker.destinationFolderURL?.lastPathComponent ?? "~/Orchestra/Notes")")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .lineLimit(1)
+                Spacer()
+                Button("Choose folder") { pickNotesDestinationFolder() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .pointerCursor()
+                if noteTaker.destinationFolderURL != nil {
+                    Button("Reset") { noteTaker.setDestinationFolder(nil) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .pointerCursor()
+                }
+            }
+        }
+    }
+
+    /// Lets the user point finished notes at a folder, e.g. their Obsidian vault.
+    private func pickNotesDestinationFolder() {
+        let openPanel = NSOpenPanel()
+        openPanel.canChooseDirectories = true
+        openPanel.canChooseFiles = false
+        openPanel.allowsMultipleSelection = false
+        openPanel.message = "Pick where finished notes go (for example an Obsidian vault folder)"
+        openPanel.prompt = "Use this folder"
+        if openPanel.runModal() == .OK, let pickedFolderURL = openPanel.url {
+            noteTaker.setDestinationFolder(pickedFolderURL)
+        }
+    }
+
+    // MARK: - Selected-text actions
+
+    private var selectedTextHintRow: some View {
+        Text("Select text + hold Shift+Control, then say \"rewrite this\", \"explain this\" or \"translate\". The result is pasted back.")
+            .font(.system(size: 10))
+            .foregroundColor(DS.Colors.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
     // MARK: - Custom connectors (MCP servers)
 
     private var connectorsSection: some View {
@@ -1143,6 +1273,19 @@ struct CompanionPanelView: View {
                             .lineLimit(1)
                     }
                     Spacer()
+                    if connectorOAuthManager.signingInConnectorIdentifier == connector.id {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Button("Sign in") {
+                            Task {
+                                connectorSignInStatusText = await connectorManager.signIn(connectorIdentifier: connector.id)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.accent)
+                        .pointerCursor()
+                    }
                     Button("Refresh") {
                         Task { await connectorManager.refreshTools(connectorIdentifier: connector.id) }
                     }
@@ -1159,9 +1302,27 @@ struct CompanionPanelView: View {
                     .pointerCursor()
                 }
             }
-            connectionTextField(placeholder: "New connector name (e.g. notion)", text: $newConnectorNameInput, isSecure: false)
+            if !connectorManager.connectors.contains(where: { $0.id == "notion" }) {
+                Button("Add Notion (sign in with your account)") {
+                    if let errorMessage = connectorManager.addConnector(name: "notion",
+                                                                        urlText: "https://mcp.notion.com/mcp",
+                                                                        token: "",
+                                                                        usesOAuth: true) {
+                        connectorSignInStatusText = errorMessage
+                    } else {
+                        Task {
+                            connectorSignInStatusText = await connectorManager.signIn(connectorIdentifier: "notion")
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.accent)
+                .pointerCursor()
+            }
+            connectionTextField(placeholder: "New connector name (e.g. linear)", text: $newConnectorNameInput, isSecure: false)
             connectionTextField(placeholder: "MCP server URL (https://…)", text: $newConnectorURLInput, isSecure: false)
-            connectionTextField(placeholder: "Token (if the server needs one)", text: $newConnectorTokenInput, isSecure: true)
+            connectionTextField(placeholder: "Token (if the server needs one; otherwise use Sign in)", text: $newConnectorTokenInput, isSecure: true)
             HStack {
                 if !connectorFormMessage.isEmpty {
                     Text(connectorFormMessage)
@@ -1186,6 +1347,68 @@ struct CompanionPanelView: View {
                 .foregroundColor(DS.Colors.accent)
                 .pointerCursor()
             }
+            if !connectorSignInStatusText.isEmpty {
+                Text(connectorSignInStatusText)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            googleAccountRow
+        }
+    }
+
+    // MARK: - Google account (Gmail, Calendar, Drive — read-only)
+
+    private var googleAccountRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Google (gmail, calendar, drive — read-only)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Colors.textSecondary)
+                .padding(.top, 6)
+            connectionTextField(
+                placeholder: hasGoogleClientCredentialsSaved ? "Google client ID (saved — paste to replace)" : "Google client ID (OAuth client, type Desktop app)",
+                text: $googleClientIDInput,
+                isSecure: false
+            )
+            connectionTextField(placeholder: "Google client secret", text: $googleClientSecretInput, isSecure: true)
+            HStack(spacing: 8) {
+                Text(googleConnectorManager.isConnected ? "Google: connected" : "Google: not connected")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Spacer()
+                if googleConnectorManager.isSigningIn {
+                    ProgressView().controlSize(.mini)
+                } else if googleConnectorManager.isConnected {
+                    Button("Disconnect") {
+                        googleConnectorManager.disconnectAccount()
+                        googleAccountStatusText = "disconnected"
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .pointerCursor()
+                } else {
+                    Button("Sign in") {
+                        Task {
+                            googleAccountStatusText = await googleConnectorManager.connectAccount()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.accent)
+                    .pointerCursor()
+                }
+            }
+            if !googleAccountStatusText.isEmpty {
+                Text(googleAccountStatusText)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("In Google Cloud Console: enable the Gmail, Google Calendar and Drive APIs, create an OAuth client of type Desktop app, and paste its id and secret here. Orchestra only asks for read access — it can't send mail or change anything.")
+                .font(.system(size: 9))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

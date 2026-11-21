@@ -65,6 +65,16 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+
+    /// Select text anywhere + hold shift+control: "rewrite this", "explain
+    /// this", "translate" — the result is pasted back (see SelectedTextActions).
+    let selectedTextShortcutMonitor = SelectedTextShortcutMonitor()
+    private let selectedTextActionRunner = SelectedTextActionRunner()
+    private var selectedTextTransitionCancellable: AnyCancellable?
+    /// The selection grabbed when the shift+control shortcut was released;
+    /// consumed by the transcript callback that follows.
+    private var pendingSelectedTextCapture: SelectedTextCapture?
+    private var isSelectedTextSessionActive = false
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
@@ -254,8 +264,13 @@ final class CompanionManager: ObservableObject {
             self?.appendChatMessage(isFromUser: false, text: announcement)
             self?.queueJobAnnouncement(announcement)
         }
+        OrchestraNoteTaker.shared.onNotesFinishedAnnouncement = { [weak self] announcement in
+            self?.appendChatMessage(isFromUser: false, text: announcement)
+            self?.queueJobAnnouncement(announcement)
+        }
         connectJobManagerToMacActions()
         observeScreenCapturesForFlash()
+        bindSelectedTextTransitions()
         orchestraJobManager.resumeUnfinishedJobs()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
@@ -411,6 +426,7 @@ final class CompanionManager: ObservableObject {
 
     func stop() {
         globalPushToTalkShortcutMonitor.stop()
+        selectedTextShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
         transientHideTask?.cancel()
@@ -419,6 +435,7 @@ final class CompanionManager: ObservableObject {
         speechOutputClient.stopPlayback()
         currentResponseTask = nil
         shortcutTransitionCancellable?.cancel()
+        selectedTextTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
@@ -436,8 +453,10 @@ final class CompanionManager: ObservableObject {
 
         if currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
+            selectedTextShortcutMonitor.start()
         } else {
             globalPushToTalkShortcutMonitor.stop()
+            selectedTextShortcutMonitor.stop()
         }
 
         hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
@@ -690,6 +709,115 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Selected-text actions (shift + control)
+
+    private func bindSelectedTextTransitions() {
+        selectedTextTransitionCancellable = selectedTextShortcutMonitor
+            .shortcutTransitionPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transition in
+                self?.handleSelectedTextTransition(transition)
+            }
+    }
+
+    /// Hold shift+control with text selected, speak the instruction, release:
+    /// the selection is grabbed on release (modifiers up, so cmd+C is clean),
+    /// and the finalized transcript decides what happens to it.
+    private func handleSelectedTextTransition(_ transition: SelectedTextShortcutTransition) {
+        switch transition {
+        case .pressed:
+            guard !isLiveSessionActive, !buddyDictationManager.isDictationInProgress,
+                  !showOnboardingVideo, hasAccessibilityPermission else { return }
+            isSelectedTextSessionActive = true
+            pendingSelectedTextCapture = nil
+
+            transientHideTask?.cancel()
+            transientHideTask = nil
+            if !isClickyCursorEnabled && !isOverlayVisible {
+                overlayWindowManager.hasShownOverlayBefore = true
+                overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                isOverlayVisible = true
+            }
+            NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+            currentResponseTask?.cancel()
+            speechOutputClient.stopPlayback()
+
+            pendingKeyboardShortcutStartTask?.cancel()
+            pendingKeyboardShortcutStartTask = Task {
+                await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+                    currentDraftText: "",
+                    updateDraftText: { _ in
+                        // Partial transcripts are hidden (waveform-only UI)
+                    },
+                    submitDraftText: { [weak self] finalTranscript in
+                        guard let self else { return }
+                        self.isSelectedTextSessionActive = false
+                        self.lastTranscript = finalTranscript
+                        self.showCaptionLine(isUserSpeech: true, fullText: finalTranscript)
+                        self.appendChatMessage(isFromUser: true, text: finalTranscript)
+                        if let selectedTextCapture = self.pendingSelectedTextCapture {
+                            self.pendingSelectedTextCapture = nil
+                            self.runSelectedTextAction(instruction: finalTranscript, capture: selectedTextCapture)
+                        } else {
+                            // Nothing was selected: answer like a normal turn.
+                            self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        }
+                    }
+                )
+            }
+        case .released:
+            guard isSelectedTextSessionActive else { return }
+            pendingKeyboardShortcutStartTask?.cancel()
+            pendingKeyboardShortcutStartTask = nil
+            // Grab the selection before the transcript finishes finalizing.
+            pendingSelectedTextCapture = selectedTextActionRunner.captureSelection()
+            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            if !buddyDictationManager.isDictationInProgress {
+                // A quick tap that never started recording: nothing will submit.
+                isSelectedTextSessionActive = false
+                pendingSelectedTextCapture = nil
+                scheduleTransientHideIfNeeded()
+            }
+        }
+    }
+
+    /// Runs the spoken instruction on the captured selection: a replacement
+    /// is pasted back over it, an explanation is spoken. Return is never
+    /// pressed, so nothing is sent.
+    private func runSelectedTextAction(instruction: String, capture: SelectedTextCapture) {
+        currentResponseTask?.cancel()
+        speechOutputClient.stopPlayback()
+        currentResponseTask = Task {
+            voiceState = .processing
+            do {
+                let transformResult = try await selectedTextActionRunner.transform(
+                    instruction: instruction, selectedText: capture.selectedText)
+                guard !Task.isCancelled else { return }
+                let spokenReply: String
+                switch transformResult.mode {
+                case .replaceSelection:
+                    selectedTextActionRunner.pasteBack(transformResult.text, capture: capture)
+                    spokenReply = "done — pasted it back."
+                case .speakAnswer:
+                    spokenReply = transformResult.text
+                }
+                showCaptionLine(isUserSpeech: false, fullText: spokenReply)
+                appendChatMessage(isFromUser: false, text: spokenReply)
+                try? await speechOutputClient.speakText(spokenReply)
+                voiceState = .responding
+            } catch is CancellationError {
+                // A newer interaction replaced this one.
+            } catch {
+                print("⚠️ Selected-text action error: \(error)")
+                try? await speechOutputClient.speakText("i couldn't transform that text just now. try again in a moment.")
+            }
+            if !Task.isCancelled {
+                voiceState = .idle
+                scheduleTransientHideIfNeeded()
+            }
+        }
+    }
+
     // MARK: - Companion Prompt
 
     /// The name typed under Connections ("Your name"), so Orchestra can use it.
@@ -715,12 +843,53 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Custom connectors
 
-    /// Tells the push-to-talk brain which connector tools exist.
-    private static var connectorPromptSection: String {
+    /// The current local date and time, so "remind me at 5" and "tomorrow"
+    /// resolve to real dates in tags and tool calls.
+    private static var currentDatePromptLine: String {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "EEEE, yyyy-MM-dd HH:mm"
+        return "\n\nright now it's \(dateFormatter.string(from: Date())) (the user's local time). use this to resolve \"today\", \"tomorrow\", \"at 5\" and similar into yyyy-MM-dd HH:mm."
+    }
+
+    /// Reminders and calendar events go straight into Apple's apps on this
+    /// Mac — no Hermes trip. Reading the day works the same way.
+    private static let calendarAndRemindersPromptSection = """
+
+    reminders and calendar on this mac (no hermes needed):
+    when the user asks to be reminded of something, add [REMINDER: <what to be reminded of> | <yyyy-MM-dd HH:mm>] (leave the time part out for no due time). it goes straight into apple reminders with an alarm.
+    when the user asks to put something on their calendar, add [EVENT: <title> | <start yyyy-MM-dd HH:mm> | <end yyyy-MM-dd HH:mm>] (end optional, defaults to one hour). it goes straight into apple calendar.
+    when the user asks what's on their calendar or reminders today/tomorrow/a date, add [SCHEDULE: today] or [SCHEDULE: tomorrow] or [SCHEDULE: yyyy-MM-dd] and say a short line like "checking your mac's calendar"; you'll get the day's events and reminders and answer from them.
+    prefer these over [ASK_HERMES:] for this mac's own calendar and reminders. use hermes only for accounts that aren't on this mac (like gmail when google isn't connected). creating reminders and events runs right away; never delete or change existing ones.
+    """
+
+    /// Lecture/meeting notes: record, transcribe, summarize to ~/Orchestra
+    /// (or the folder the user picked, e.g. an Obsidian vault).
+    private static let notesPromptSection = """
+
+    taking notes on a lecture or meeting:
+    when the user says "take notes on this", "take notes", "record this lecture/meeting", add [NOTES: start <what it's about, or nothing>] and say one short line. orchestra then records the audio and transcribes it in the background — the conversation keeps working normally.
+    when they say "stop taking notes", "finish the notes", add [NOTES: stop]. the recording stops, a summary is written to ~/Orchestra/Notes (or the folder they picked in the menu), and orchestra announces where it is when it's done. don't say the notes are saved until that announcement.
+    """
+
+    /// Tells the voice brain which connector tools exist (custom MCP
+    /// connectors plus the built-in read-only google connector).
+    private static func connectorPromptSection(isLiveMode: Bool) -> String {
         let connectorManager = MCPConnectorManager.shared
-        guard connectorManager.hasUsableTools else { return "" }
-        return "\n\nthe user's connected apps (custom connectors). to use one, add exactly one [CONNECTOR: <connector> <tool> <json object of arguments>] tag, e.g. [CONNECTOR: notion search {\"query\": \"exam plan\"}], and say only a short line like \"checking notion\"; you'll get the result and answer from it. tools marked [needs the user's yes] are asked about first.\n"
-            + connectorManager.toolCatalogForPrompt
+        let googleConnectorManager = GoogleConnectorManager.shared
+        var sectionText = ""
+        if connectorManager.hasUsableTools {
+            sectionText += isLiveMode
+                ? "\n\nthe user's connected apps — call them with connector_tool (connector, tool, arguments_json). tools marked [needs the user's yes] get parked: tell the user what will happen, and after they say yes call confirm_connector_action.\n"
+                : "\n\nthe user's connected apps (custom connectors). to use one, add exactly one [CONNECTOR: <connector> <tool> <json object of arguments>] tag, e.g. [CONNECTOR: notion search {\"query\": \"exam plan\"}], and say only a short line like \"checking notion\"; you'll get the result and answer from it. tools marked [needs the user's yes] are asked about first.\n"
+            sectionText += connectorManager.toolCatalogForPrompt
+        }
+        if googleConnectorManager.isConnected {
+            sectionText += "\n\n" + googleConnectorManager.toolCatalogForPrompt
+            sectionText += isLiveMode
+                ? "\ncall these with connector_tool, connector=\"google\". they only read — nothing is sent or changed."
+                : "\nuse them with [CONNECTOR: google <tool> <json object of arguments>]. they only read — nothing is sent or changed."
+        }
+        return sectionText
     }
 
     /// A second, short model call that turns a tool result into a spoken answer.
@@ -995,11 +1164,15 @@ final class CompanionManager: ObservableObject {
 
                 let systemPromptWithRecentJobs = Self.companionVoiceResponseSystemPrompt
                     + Self.userNamePromptLine
+                    + Self.currentDatePromptLine
+                    + OrchestraMemoryStore.shared.promptSection(isLiveMode: false)
                     + "\n\nrecent jobs (newest first):\n"
                     + orchestraJobManager.recentJobsSummaryForPrompt()
                     + "\n\nrepeating routines:\n"
                     + orchestraJobManager.routinesSummaryForPrompt()
-                    + Self.connectorPromptSection
+                    + Self.connectorPromptSection(isLiveMode: false)
+                    + Self.calendarAndRemindersPromptSection
+                    + Self.notesPromptSection
                     + Self.agentRosterPromptSection
                     + (isScreenShared ? "" : "\n\nscreen sharing is OFF for this question: you cannot see the user's screen. don't point, draw, click or take over; if the user needs you to look, tell them to say \"look at my screen\" (or turn screen sharing on in the orchestra menu).")
 
@@ -1042,6 +1215,25 @@ final class CompanionManager: ObservableObject {
                 // [CONNECTOR: name tool {json}] = use one of the user's custom connectors.
                 let connectorParseResult = ConnectorTagParser.extractConnectorCall(from: fullResponseText)
                 fullResponseText = connectorParseResult.remainingText
+
+                // [REMEMBER: fact] / [FORGET: words] = long-term memory of the user.
+                let rememberParseResult = Self.extractAllTagContents(named: "REMEMBER", from: fullResponseText)
+                fullResponseText = rememberParseResult.remainingText
+                let forgetParseResult = Self.extractTagContent(named: "FORGET", from: fullResponseText)
+                fullResponseText = forgetParseResult.remainingText
+
+                // [REMINDER: title | when] / [EVENT: title | start | end] /
+                // [SCHEDULE: day] = straight into Apple Reminders and Calendar.
+                let reminderParseResult = Self.extractTagContent(named: "REMINDER", from: fullResponseText)
+                fullResponseText = reminderParseResult.remainingText
+                let calendarEventParseResult = Self.extractTagContent(named: "EVENT", from: fullResponseText)
+                fullResponseText = calendarEventParseResult.remainingText
+                let scheduleParseResult = Self.extractTagContent(named: "SCHEDULE", from: fullResponseText)
+                fullResponseText = scheduleParseResult.remainingText
+
+                // [NOTES: start <topic>] / [NOTES: stop] = lecture/meeting notes.
+                let notesParseResult = Self.extractTagContent(named: "NOTES", from: fullResponseText)
+                fullResponseText = notesParseResult.remainingText
 
                 // [SHOWME: goal] = the user wants to learn it: guide them step by step.
                 let showMeParseResult = Self.extractTagContent(named: "SHOWME", from: fullResponseText)
@@ -1105,15 +1297,77 @@ final class CompanionManager: ObservableObject {
 
                 // Run the connector tool, then answer with what it returned.
                 if let connectorCall = connectorParseResult.call {
-                    let toolResult = await MCPConnectorManager.shared.runTool(
-                        connectorIdentifier: connectorCall.connectorIdentifier,
-                        toolName: connectorCall.toolName,
-                        argumentsJSONText: connectorCall.argumentsJSONText)
+                    let toolResult: String
+                    if connectorCall.connectorIdentifier == GoogleConnectorManager.connectorIdentifier {
+                        toolResult = await GoogleConnectorManager.shared.runTool(
+                            toolName: connectorCall.toolName,
+                            argumentsJSONText: connectorCall.argumentsJSONText)
+                    } else {
+                        toolResult = await MCPConnectorManager.shared.runTool(
+                            connectorIdentifier: connectorCall.connectorIdentifier,
+                            toolName: connectorCall.toolName,
+                            argumentsJSONText: connectorCall.argumentsJSONText)
+                    }
                     guard !Task.isCancelled else { return }
                     spokenText = await answerWithConnectorResult(
                         transcript: transcript,
                         callDescription: "\(connectorCall.connectorIdentifier) \(connectorCall.toolName) \(connectorCall.argumentsJSONText)",
                         toolResult: toolResult)
+                }
+
+                // Long-term memory: keep new facts, drop forgotten ones.
+                for rememberFactText in rememberParseResult.tagContents {
+                    OrchestraMemoryStore.shared.remember(rememberFactText)
+                }
+                if let forgetWordsText = forgetParseResult.tagContent {
+                    let removedFactCount = OrchestraMemoryStore.shared.forget(matching: forgetWordsText)
+                    if removedFactCount == 0 {
+                        spokenText = "i couldn't find anything like that in my memory."
+                    }
+                }
+
+                // Apple Reminders and Calendar, right on this Mac.
+                if let reminderText = reminderParseResult.tagContent {
+                    let reminderPieces = reminderText.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    let reminderOutcome = await MacCalendarReminders.shared.addReminder(
+                        title: reminderPieces.first ?? "",
+                        whenText: reminderPieces.count > 1 ? reminderPieces[1] : "")
+                    guard !Task.isCancelled else { return }
+                    if !reminderOutcome.succeeded { spokenText = reminderOutcome.message }
+                }
+                if let calendarEventText = calendarEventParseResult.tagContent {
+                    let eventPieces = calendarEventText.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    let eventOutcome = await MacCalendarReminders.shared.addEvent(
+                        title: eventPieces.first ?? "",
+                        startText: eventPieces.count > 1 ? eventPieces[1] : "",
+                        endText: eventPieces.count > 2 ? eventPieces[2] : "")
+                    guard !Task.isCancelled else { return }
+                    if !eventOutcome.succeeded { spokenText = eventOutcome.message }
+                }
+                if let scheduleDayText = scheduleParseResult.tagContent {
+                    let scheduleText = await MacCalendarReminders.shared.scheduleSummary(dayText: scheduleDayText)
+                    guard !Task.isCancelled else { return }
+                    spokenText = await answerWithConnectorResult(
+                        transcript: transcript,
+                        callDescription: "the user's mac calendar and reminders for \(scheduleDayText)",
+                        toolResult: scheduleText)
+                }
+
+                // Lecture/meeting notes. On a successful stop the save location
+                // is announced separately when the summary is written, so the
+                // spoken line here stays the model's own ("stopping now").
+                if let notesCommandText = notesParseResult.tagContent {
+                    let notesPieces = notesCommandText.split(separator: " ", maxSplits: 1).map(String.init)
+                    let notesAction = notesPieces.first?.lowercased() ?? "start"
+                    let notesTopicHint = notesPieces.count > 1 ? notesPieces[1] : ""
+                    let notesOutcome: (succeeded: Bool, message: String)
+                    if notesAction == "stop" {
+                        notesOutcome = await OrchestraNoteTaker.shared.stopNotes()
+                    } else {
+                        notesOutcome = await OrchestraNoteTaker.shared.startNotes(topicHint: notesTopicHint)
+                    }
+                    guard !Task.isCancelled else { return }
+                    if !notesOutcome.succeeded { spokenText = notesOutcome.message }
                 }
 
                 if let macJobBrief = macJobParseResult.tagContent {
@@ -1321,6 +1575,7 @@ final class CompanionManager: ObservableObject {
         let shouldListen = isWakeWordEnabled && hasCompletedOnboarding
             && !isLiveConnectingOrOn
             && !buddyDictationManager.isDictationInProgress
+            && !OrchestraNoteTaker.shared.isRecording
             && voiceState != .listening && voiceState != .processing
             && !speechOutputClient.isPlaying
         if !isLiveConnectingOrOn { isLiveSessionStartedByWakeWord = false }
@@ -1365,10 +1620,10 @@ final class CompanionManager: ObservableObject {
 
         let liveSystemInstruction = Self.liveVoiceSystemPrompt
             + Self.userNamePromptLine
+            + Self.currentDatePromptLine
+            + OrchestraMemoryStore.shared.promptSection(isLiveMode: true)
             + "\n\nthe user's named agents (pass agent=<name> to start_job when a request belongs to one; create_agent makes a new one):\n" + OrchestraAgentStore.shared.rosterForPrompt
-            + (MCPConnectorManager.shared.hasUsableTools
-               ? "\n\nthe user's connected apps — call them with connector_tool (connector, tool, arguments_json). tools marked [needs the user's yes] get parked: tell the user what will happen, and after they say yes call confirm_connector_action.\n" + MCPConnectorManager.shared.toolCatalogForPrompt
-               : "")
+            + Self.connectorPromptSection(isLiveMode: true)
             + "\n\nrecent jobs (newest first):\n" + orchestraJobManager.recentJobsSummaryForPrompt()
             + "\n\nrepeating routines:\n" + orchestraJobManager.routinesSummaryForPrompt()
             + (ScreenSharingMode.current == .always
@@ -1495,6 +1750,38 @@ final class CompanionManager: ObservableObject {
                     self?.geminiLiveSession?.stop()
                 }
                 return "closing after your goodbye"
+            },
+            rememberFact: { factText in
+                OrchestraMemoryStore.shared.remember(factText)
+                    ? "remembered: \(factText.prefix(160))"
+                    : "not kept (empty, duplicate, or it looked like a secret or a standing order)"
+            },
+            forgetFact: { wordsText in
+                let removedFactCount = OrchestraMemoryStore.shared.forget(matching: wordsText)
+                return removedFactCount > 0 ? "forgot \(removedFactCount) fact(s)" : "nothing in memory matched those words"
+            },
+            addReminder: { title, whenText in
+                let reminderOutcome = await MacCalendarReminders.shared.addReminder(title: title, whenText: whenText)
+                return reminderOutcome.message
+            },
+            addCalendarEvent: { title, startText, endText in
+                let eventOutcome = await MacCalendarReminders.shared.addEvent(title: title, startText: startText, endText: endText)
+                return eventOutcome.message
+            },
+            mySchedule: { dayText in
+                await MacCalendarReminders.shared.scheduleSummary(dayText: dayText)
+            },
+            takeNotes: { action, topicHint in
+                let notesOutcome: (succeeded: Bool, message: String)
+                if action == "stop" {
+                    notesOutcome = await OrchestraNoteTaker.shared.stopNotes()
+                } else {
+                    notesOutcome = await OrchestraNoteTaker.shared.startNotes(topicHint: topicHint)
+                }
+                if action == "stop" && notesOutcome.succeeded {
+                    return "recording stopped; the summary is being written and the user will be told where it's saved. say one short line like 'writing them up now'."
+                }
+                return notesOutcome.message
             }
         )
 
@@ -1548,6 +1835,11 @@ final class CompanionManager: ObservableObject {
     - start_job: real work in the background. place "hermes" for research, the web, and their accounts (email, calendar, files, notes, reminders, github). place "mac" for their mac's files and apps. the brief must stand on its own.
     - add_routine: when the user wants something on a schedule.
     - recent_jobs: when the user asks how a job went.
+    - remember_fact / forget_fact: keep or drop durable facts about the user across conversations (their courses, schedule, how they like answers). use them when the user shares something lasting or asks you to remember/forget.
+    - add_reminder: "remind me at 5 to study 307" goes straight into apple reminders on this mac — no hermes. resolve the time from the current date in your instructions.
+    - add_calendar_event: put an event straight into apple calendar on this mac — no hermes.
+    - my_schedule: read this mac's apple calendar and due reminders for today/tomorrow/a date. prefer it over hermes for the mac's own calendar and reminders.
+    - take_notes: "take notes on this" records the lecture or meeting (action=start); "stop taking notes" (action=stop) writes summary notes to ~/Orchestra/Notes or the folder the user picked, and announces where they are when done.
 
     rules: confirm before anything that deletes, sends or posts to other people, or spends money (those become drafts or their last click). never claim you did something unless the tool said so. never read out passwords or codes.
     """

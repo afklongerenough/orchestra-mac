@@ -12,8 +12,10 @@
 //  parked, Orchestra says exactly what it will do, and it runs only after the
 //  user says yes (checked against what the user actually said).
 //
-//  Only servers that accept a bearer token (or carry their key in the URL)
-//  are supported for now; "sign in with…" (OAuth) servers aren't yet.
+//  Servers can take a bearer token (or carry their key in the URL), or the
+//  user can sign in with OAuth ("Sign in" on the connector row) — that's how
+//  Notion's hosted server works. See ConnectorOAuth.swift. Gmail, Google
+//  Calendar and Drive are a built-in read-only connector (GoogleConnector.swift).
 //
 
 import Combine
@@ -24,6 +26,9 @@ struct MCPConnectorConfig: Codable, Identifiable, Equatable {
     var id: String
     var urlText: String
     var isEnabled: Bool
+    /// True when this connector uses browser sign-in (OAuth) instead of a
+    /// pasted token. Optional so connectors saved by older builds still load.
+    var usesOAuth: Bool?
 }
 
 struct MCPToolInfo: Equatable {
@@ -127,7 +132,7 @@ actor MCPHTTPClient {
             mcpSessionIdentifier = newSessionIdentifier
         }
         if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
-            throw MCPError(message: "the server refused the token (\(httpResponse.statusCode)); it may need a sign-in Orchestra doesn't support yet")
+            throw MCPError(message: "the server refused the token (\(httpResponse.statusCode)); press Sign in on this connector if it uses OAuth, or check its token")
         }
         if httpResponse.statusCode == 404, mcpSessionIdentifier != nil {
             mcpSessionIdentifier = nil
@@ -179,6 +184,9 @@ final class MCPConnectorManager: ObservableObject {
 
     private static let connectorsDefaultsKey = "mcpConnectors"
     private var clientsByConnector: [String: MCPHTTPClient] = [:]
+    /// The bearer token each cached client was built with. OAuth access
+    /// tokens rotate, so a changed token means a fresh client.
+    private var clientTokenByConnector: [String: String] = [:]
 
     /// Verbs that change things. Matched against the tool name split into
     /// words (send_email, sendMessage and SendMessage all become "send message").
@@ -213,7 +221,7 @@ final class MCPConnectorManager: ObservableObject {
     // MARK: - Managing connectors
 
     /// Returns an error message, or nil when added.
-    func addConnector(name: String, urlText: String, token: String) -> String? {
+    func addConnector(name: String, urlText: String, token: String, usesOAuth: Bool = false) -> String? {
         let connectorIdentifier = name.lowercased()
             .replacingOccurrences(of: #"[^a-z0-9]+"#, with: "_", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
@@ -222,17 +230,37 @@ final class MCPConnectorManager: ObservableObject {
             return "the address must start with https://"
         }
         guard !connectors.contains(where: { $0.id == connectorIdentifier }) else { return "there's already a connector called \(connectorIdentifier)" }
-        connectors.append(MCPConnectorConfig(id: connectorIdentifier, urlText: url.absoluteString, isEnabled: true))
+        connectors.append(MCPConnectorConfig(id: connectorIdentifier, urlText: url.absoluteString, isEnabled: true, usesOAuth: usesOAuth ? true : nil))
         KeychainStore.writeCustomSecret(token, named: "mcp-token-\(connectorIdentifier)")
         saveConnectors()
         Task { await refreshTools(connectorIdentifier: connectorIdentifier) }
         return nil
     }
 
+    /// Browser sign-in (OAuth) for one connector — Notion's hosted server and
+    /// any other MCP server that advertises OAuth endpoints. Returns a short
+    /// status line for the menu.
+    func signIn(connectorIdentifier: String) async -> String {
+        guard let connector = connectors.first(where: { $0.id == connectorIdentifier }) else { return "no such connector" }
+        let signInStatus = await ConnectorOAuthManager.shared.signIn(connectorIdentifier: connectorIdentifier,
+                                                                     serverURLText: connector.urlText)
+        guard signInStatus == "signed in" else { return signInStatus }
+        if let connectorIndex = connectors.firstIndex(where: { $0.id == connectorIdentifier }) {
+            connectors[connectorIndex].usesOAuth = true
+            saveConnectors()
+        }
+        clientsByConnector[connectorIdentifier] = nil
+        clientTokenByConnector[connectorIdentifier] = nil
+        await refreshTools(connectorIdentifier: connectorIdentifier)
+        return "signed in — \(statusByConnector[connectorIdentifier] ?? "checking tools")"
+    }
+
     func removeConnector(connectorIdentifier: String) {
         connectors.removeAll { $0.id == connectorIdentifier }
         KeychainStore.writeCustomSecret("", named: "mcp-token-\(connectorIdentifier)")
+        ConnectorOAuthManager.shared.signOut(connectorIdentifier: connectorIdentifier)
         clientsByConnector[connectorIdentifier] = nil
+        clientTokenByConnector[connectorIdentifier] = nil
         toolsByConnector[connectorIdentifier] = nil
         statusByConnector[connectorIdentifier] = nil
         saveConnectors()
@@ -258,8 +286,10 @@ final class MCPConnectorManager: ObservableObject {
     }
 
     func refreshTools(connectorIdentifier: String) async {
-        guard let client = client(for: connectorIdentifier) else {
-            statusByConnector[connectorIdentifier] = "bad address"
+        guard connectors.contains(where: { $0.id == connectorIdentifier && $0.isEnabled }) else { return }
+        guard let client = await client(for: connectorIdentifier) else {
+            let usesOAuth = connectors.first(where: { $0.id == connectorIdentifier })?.usesOAuth == true
+            statusByConnector[connectorIdentifier] = usesOAuth ? "needs sign-in (press Sign in)" : "bad address"
             return
         }
         statusByConnector[connectorIdentifier] = "connecting…"
@@ -278,13 +308,25 @@ final class MCPConnectorManager: ObservableObject {
         }
     }
 
-    private func client(for connectorIdentifier: String) -> MCPHTTPClient? {
-        if let existingClient = clientsByConnector[connectorIdentifier] { return existingClient }
+    /// Builds (or reuses) the HTTP client with a current bearer token: the
+    /// pasted token, or a fresh OAuth access token for sign-in connectors.
+    private func client(for connectorIdentifier: String) async -> MCPHTTPClient? {
         guard let connector = connectors.first(where: { $0.id == connectorIdentifier && $0.isEnabled }),
               let endpointURL = URL(string: connector.urlText) else { return nil }
-        let newClient = MCPHTTPClient(endpointURL: endpointURL,
-                                      bearerToken: KeychainStore.readCustomSecret(named: "mcp-token-\(connectorIdentifier)"))
+        let bearerToken: String?
+        if connector.usesOAuth == true {
+            bearerToken = await ConnectorOAuthManager.shared.validAccessToken(connectorIdentifier: connectorIdentifier)
+            guard bearerToken != nil else { return nil }
+        } else {
+            bearerToken = KeychainStore.readCustomSecret(named: "mcp-token-\(connectorIdentifier)")
+        }
+        if let existingClient = clientsByConnector[connectorIdentifier],
+           clientTokenByConnector[connectorIdentifier] == (bearerToken ?? "") {
+            return existingClient
+        }
+        let newClient = MCPHTTPClient(endpointURL: endpointURL, bearerToken: bearerToken)
         clientsByConnector[connectorIdentifier] = newClient
+        clientTokenByConnector[connectorIdentifier] = bearerToken ?? ""
         return newClient
     }
 
@@ -386,7 +428,12 @@ final class MCPConnectorManager: ObservableObject {
     func cancelPendingRiskyCall() { pendingRiskyCall = nil }
 
     private func execute(connectorIdentifier: String, toolName: String, arguments: [String: Any]) async -> String {
-        guard let client = client(for: connectorIdentifier) else { return "connector \(connectorIdentifier) is off or missing" }
+        guard let client = await client(for: connectorIdentifier) else {
+            let usesOAuth = connectors.first(where: { $0.id == connectorIdentifier })?.usesOAuth == true
+            return usesOAuth
+                ? "connector \(connectorIdentifier) needs a fresh sign-in; ask the user to press Sign in on it under connections"
+                : "connector \(connectorIdentifier) is off or missing"
+        }
         do {
             let resultText = try await client.callTool(named: toolName, arguments: arguments)
             OrchestraLog.write("🔌 \(connectorIdentifier).\(toolName) ok (\(resultText.count) chars)")

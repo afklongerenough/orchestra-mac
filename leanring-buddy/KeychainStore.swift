@@ -28,6 +28,9 @@ enum KeychainStore {
         case spotifyClientSecret = "spotify-client-secret"
         case openCodeAPIKey = "opencode-api-key"
         case spotifyRefreshToken = "spotify-refresh-token"
+        case googleClientID = "google-client-id"
+        case googleClientSecret = "google-client-secret"
+        case googleRefreshToken = "google-refresh-token"
     }
 
     private static let secretsLock = NSLock()

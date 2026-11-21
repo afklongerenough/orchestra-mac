@@ -44,6 +44,12 @@ final class GeminiLiveSession: NSObject {
         let addRoutine: (_ schedule: String, _ place: OrchestraJobPlace, _ brief: String) -> String
         let recentJobsSummary: () -> String
         let endConversation: () -> String
+        let rememberFact: (_ fact: String) -> String
+        let forgetFact: (_ words: String) -> String
+        let addReminder: (_ title: String, _ when: String) async -> String
+        let addCalendarEvent: (_ title: String, _ start: String, _ end: String) async -> String
+        let mySchedule: (_ day: String) async -> String
+        let takeNotes: (_ action: String, _ topic: String) async -> String
     }
 
     static let defaultLiveModel = "gemini-3.8-live"
@@ -295,6 +301,36 @@ final class GeminiLiveSession: NSObject {
             "name": "recent_jobs",
             "description": "List the user's recent jobs and their results.",
             "parameters": stringParameters([], required: [])
+        ],
+        [
+            "name": "remember_fact",
+            "description": "Keep one durable fact about the user across conversations (their courses, schedule, goals, how they like answers), or when they ask you to remember something. fact = one short line in third person, e.g. 'the user prefers short spoken answers and studies in the evening'. No secrets, passwords or tokens.",
+            "parameters": stringParameters(["fact"], required: ["fact"])
+        ],
+        [
+            "name": "forget_fact",
+            "description": "Remove remembered facts about the user when they ask you to forget something. words = words from the fact to forget.",
+            "parameters": stringParameters(["words"], required: ["words"])
+        ],
+        [
+            "name": "add_reminder",
+            "description": "Add a reminder straight to Apple Reminders on this Mac (no hermes). title = what to be reminded of, when = 'yyyy-MM-dd HH:mm' local time (empty for no due time). Use the current date from your instructions to resolve 'at 5', 'tomorrow', etc.",
+            "parameters": stringParameters(["title", "when"], required: ["title"])
+        ],
+        [
+            "name": "add_calendar_event",
+            "description": "Add an event straight to Apple Calendar on this Mac (no hermes). title, start = 'yyyy-MM-dd HH:mm', end = 'yyyy-MM-dd HH:mm' (empty end = one hour). Local time; resolve relative times from the current date in your instructions.",
+            "parameters": stringParameters(["title", "start", "end"], required: ["title", "start"])
+        ],
+        [
+            "name": "my_schedule",
+            "description": "Read this Mac's Apple Calendar events and due Apple Reminders for one day: day = 'today', 'tomorrow' or 'yyyy-MM-dd'. Prefer this over hermes for the mac's own calendar and reminders.",
+            "parameters": stringParameters(["day"], required: [])
+        ],
+        [
+            "name": "take_notes",
+            "description": "Record a lecture or meeting and write summary notes afterwards. action = 'start' (topic = what it's about, optional) or 'stop' (finishes the recording, writes the notes and announces where they are). Notes are saved to ~/Orchestra/Notes or the folder the user picked.",
+            "parameters": stringParameters(["action", "topic"], required: ["action"])
         ]
     ]
 
@@ -431,10 +467,16 @@ final class GeminiLiveSession: NSObject {
         case "stop_screen_takeover":
             return toolHandlers.stopTakeover()
         case "connector_tool":
+            let connectorIdentifier = (arguments["connector"] as? String ?? "").lowercased()
+            let toolName = arguments["tool"] as? String ?? ""
+            let argumentsJSONText = arguments["arguments_json"] as? String ?? "{}"
+            if connectorIdentifier == GoogleConnectorManager.connectorIdentifier {
+                return await GoogleConnectorManager.shared.runTool(toolName: toolName, argumentsJSONText: argumentsJSONText)
+            }
             return await MCPConnectorManager.shared.runTool(
-                connectorIdentifier: (arguments["connector"] as? String ?? "").lowercased(),
-                toolName: arguments["tool"] as? String ?? "",
-                argumentsJSONText: arguments["arguments_json"] as? String ?? "{}")
+                connectorIdentifier: connectorIdentifier,
+                toolName: toolName,
+                argumentsJSONText: argumentsJSONText)
         case "confirm_connector_action":
             // Checked against what the user actually said, not the model's word.
             guard let parkedDate = MCPConnectorManager.shared.pendingRiskyCall?.createdDate else {
@@ -480,6 +522,21 @@ final class GeminiLiveSession: NSObject {
             return toolHandlers.endConversation()
         case "recent_jobs":
             return toolHandlers.recentJobsSummary()
+        case "remember_fact":
+            return toolHandlers.rememberFact(arguments["fact"] as? String ?? "")
+        case "forget_fact":
+            return toolHandlers.forgetFact(arguments["words"] as? String ?? "")
+        case "add_reminder":
+            return await toolHandlers.addReminder(arguments["title"] as? String ?? "", arguments["when"] as? String ?? "")
+        case "add_calendar_event":
+            return await toolHandlers.addCalendarEvent(arguments["title"] as? String ?? "",
+                                                       arguments["start"] as? String ?? "",
+                                                       arguments["end"] as? String ?? "")
+        case "my_schedule":
+            return await toolHandlers.mySchedule(arguments["day"] as? String ?? "today")
+        case "take_notes":
+            return await toolHandlers.takeNotes((arguments["action"] as? String ?? "start").lowercased(),
+                                                arguments["topic"] as? String ?? "")
         default:
             return "unknown tool"
         }
