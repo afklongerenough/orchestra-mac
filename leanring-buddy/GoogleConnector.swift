@@ -205,27 +205,45 @@ final class GoogleConnectorManager: ObservableObject {
 
     // MARK: - Gmail (read-only)
 
+    /// Builds an API URL without force-unwrapping: a bad address returns nil
+    /// and the caller reports it instead of crashing.
+    private static func apiURL(_ urlText: String, queryItems: [URLQueryItem]) -> URL? {
+        guard var components = URLComponents(string: urlText) else { return nil }
+        components.queryItems = queryItems
+        return components.url
+    }
+
+    /// Model-supplied ids go into URL paths percent-encoded (only letters,
+    /// digits, - and _ stay literal), so a hostile id can't reshape the URL.
+    private static func encodedPathIdentifier(_ identifier: String) -> String? {
+        let identifierAllowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        guard let encodedIdentifier = identifier.addingPercentEncoding(withAllowedCharacters: identifierAllowedCharacters),
+              !encodedIdentifier.isEmpty else { return nil }
+        return encodedIdentifier
+    }
+
     private func gmailSearch(query: String, maxResults: Int, accessToken: String) async throws -> String {
-        var listComponents = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
-        listComponents.queryItems = [
+        guard let listURL = Self.apiURL("https://gmail.googleapis.com/gmail/v1/users/me/messages", queryItems: [
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "maxResults", value: String(max(1, min(maxResults, 10))))
-        ]
-        guard let listJSON = try await getAuthorizedJSON(listComponents.url, accessToken: accessToken),
+        ]) else {
+            return "couldn't build the gmail search address"
+        }
+        guard let listJSON = try await getAuthorizedJSON(listURL, accessToken: accessToken),
               let messageStubs = listJSON["messages"] as? [[String: Any]], !messageStubs.isEmpty else {
             return "no emails matched \"\(query)\""
         }
         var resultLines: [String] = []
         for messageStub in messageStubs.prefix(6) {
-            guard let messageIdentifier = messageStub["id"] as? String else { continue }
-            var messageComponents = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/\(messageIdentifier)")!
-            messageComponents.queryItems = [
-                URLQueryItem(name: "format", value: "metadata"),
-                URLQueryItem(name: "metadataHeaders", value: "Subject"),
-                URLQueryItem(name: "metadataHeaders", value: "From"),
-                URLQueryItem(name: "metadataHeaders", value: "Date")
-            ]
-            guard let messageJSON = try await getAuthorizedJSON(messageComponents.url, accessToken: accessToken) else { continue }
+            guard let messageIdentifier = messageStub["id"] as? String,
+                  let encodedMessageIdentifier = Self.encodedPathIdentifier(messageIdentifier),
+                  let messageURL = Self.apiURL("https://gmail.googleapis.com/gmail/v1/users/me/messages/\(encodedMessageIdentifier)", queryItems: [
+                    URLQueryItem(name: "format", value: "metadata"),
+                    URLQueryItem(name: "metadataHeaders", value: "Subject"),
+                    URLQueryItem(name: "metadataHeaders", value: "From"),
+                    URLQueryItem(name: "metadataHeaders", value: "Date")
+                  ]) else { continue }
+            guard let messageJSON = try await getAuthorizedJSON(messageURL, accessToken: accessToken) else { continue }
             let headers = (messageJSON["payload"] as? [String: Any])?["headers"] as? [[String: Any]] ?? []
             func headerValue(_ headerName: String) -> String {
                 (headers.first { ($0["name"] as? String)?.lowercased() == headerName.lowercased() }?["value"] as? String) ?? ""
@@ -237,9 +255,13 @@ final class GoogleConnectorManager: ObservableObject {
     }
 
     private func gmailRead(messageIdentifier: String, accessToken: String) async throws -> String {
-        var messageComponents = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/\(messageIdentifier)")!
-        messageComponents.queryItems = [URLQueryItem(name: "format", value: "full")]
-        guard let messageJSON = try await getAuthorizedJSON(messageComponents.url, accessToken: accessToken) else {
+        guard let encodedMessageIdentifier = Self.encodedPathIdentifier(messageIdentifier),
+              let messageURL = Self.apiURL("https://gmail.googleapis.com/gmail/v1/users/me/messages/\(encodedMessageIdentifier)", queryItems: [
+                URLQueryItem(name: "format", value: "full")
+              ]) else {
+            return "bad message id"
+        }
+        guard let messageJSON = try await getAuthorizedJSON(messageURL, accessToken: accessToken) else {
             return "couldn't read that email"
         }
         let payload = messageJSON["payload"] as? [String: Any] ?? [:]
@@ -305,15 +327,16 @@ final class GoogleConnectorManager: ObservableObject {
         let timeMinDate = timeMinText.flatMap(Self.parseGoogleDate) ?? Date()
         let timeMaxDate = timeMaxText.flatMap(Self.parseGoogleDate) ?? timeMinDate.addingTimeInterval(7 * 86_400)
         let isoFormatter = ISO8601DateFormatter()
-        var eventsComponents = URLComponents(string: "https://www.googleapis.com/calendar/v3/calendars/primary/events")!
-        eventsComponents.queryItems = [
+        guard let eventsURL = Self.apiURL("https://www.googleapis.com/calendar/v3/calendars/primary/events", queryItems: [
             URLQueryItem(name: "timeMin", value: isoFormatter.string(from: timeMinDate)),
             URLQueryItem(name: "timeMax", value: isoFormatter.string(from: timeMaxDate)),
             URLQueryItem(name: "singleEvents", value: "true"),
             URLQueryItem(name: "orderBy", value: "startTime"),
             URLQueryItem(name: "maxResults", value: "25")
-        ]
-        guard let eventsJSON = try await getAuthorizedJSON(eventsComponents.url, accessToken: accessToken),
+        ]) else {
+            return "couldn't build the calendar address"
+        }
+        guard let eventsJSON = try await getAuthorizedJSON(eventsURL, accessToken: accessToken),
               let eventItems = eventsJSON["items"] as? [[String: Any]], !eventItems.isEmpty else {
             return "no google calendar events in that range"
         }
@@ -365,14 +388,15 @@ final class GoogleConnectorManager: ObservableObject {
             let escapedQuery = trimmedQuery.replacingOccurrences(of: "'", with: "\\'")
             driveQuery = "(name contains '\(escapedQuery)' or fullText contains '\(escapedQuery)')"
         }
-        var searchComponents = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
-        searchComponents.queryItems = [
+        guard let searchURL = Self.apiURL("https://www.googleapis.com/drive/v3/files", queryItems: [
             URLQueryItem(name: "q", value: driveQuery + " and trashed = false"),
             URLQueryItem(name: "pageSize", value: String(max(1, min(maxResults, 15)))),
             URLQueryItem(name: "fields", value: "files(id,name,mimeType,modifiedTime)"),
             URLQueryItem(name: "orderBy", value: "modifiedTime desc")
-        ]
-        guard let searchJSON = try await getAuthorizedJSON(searchComponents.url, accessToken: accessToken),
+        ]) else {
+            return "couldn't build the drive search address"
+        }
+        guard let searchJSON = try await getAuthorizedJSON(searchURL, accessToken: accessToken),
               let fileItems = searchJSON["files"] as? [[String: Any]], !fileItems.isEmpty else {
             return "no drive files matched \"\(query)\""
         }
@@ -383,23 +407,33 @@ final class GoogleConnectorManager: ObservableObject {
     }
 
     private func driveRead(fileIdentifier: String, accessToken: String) async throws -> String {
-        var metadataComponents = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(fileIdentifier)")!
-        metadataComponents.queryItems = [URLQueryItem(name: "fields", value: "id,name,mimeType,size")]
-        guard let metadataJSON = try await getAuthorizedJSON(metadataComponents.url, accessToken: accessToken) else {
+        guard let encodedFileIdentifier = Self.encodedPathIdentifier(fileIdentifier),
+              let metadataURL = Self.apiURL("https://www.googleapis.com/drive/v3/files/\(encodedFileIdentifier)", queryItems: [
+                URLQueryItem(name: "fields", value: "id,name,mimeType,size")
+              ]) else {
+            return "bad file id"
+        }
+        guard let metadataJSON = try await getAuthorizedJSON(metadataURL, accessToken: accessToken) else {
             return "couldn't find that drive file"
         }
         let mimeType = (metadataJSON["mimeType"] as? String) ?? ""
         let fileName = (metadataJSON["name"] as? String) ?? fileIdentifier
         if mimeType == "application/vnd.google-apps.document" {
-            var exportComponents = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(fileIdentifier)/export")!
-            exportComponents.queryItems = [URLQueryItem(name: "mimeType", value: "text/plain")]
-            let exportText = try await getAuthorizedText(exportComponents.url, accessToken: accessToken)
+            guard let exportURL = Self.apiURL("https://www.googleapis.com/drive/v3/files/\(encodedFileIdentifier)/export", queryItems: [
+                URLQueryItem(name: "mimeType", value: "text/plain")
+            ]) else {
+                return "couldn't build the drive export address"
+            }
+            let exportText = try await getAuthorizedText(exportURL, accessToken: accessToken)
             return "\(fileName):\n\(String(exportText.prefix(6000)))"
         }
         if mimeType.hasPrefix("text/") || mimeType == "application/json" {
-            var mediaComponents = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(fileIdentifier)")!
-            mediaComponents.queryItems = [URLQueryItem(name: "alt", value: "media")]
-            let fileText = try await getAuthorizedText(mediaComponents.url, accessToken: accessToken)
+            guard let mediaURL = Self.apiURL("https://www.googleapis.com/drive/v3/files/\(encodedFileIdentifier)", queryItems: [
+                URLQueryItem(name: "alt", value: "media")
+            ]) else {
+                return "couldn't build the drive file address"
+            }
+            let fileText = try await getAuthorizedText(mediaURL, accessToken: accessToken)
             return "\(fileName):\n\(String(fileText.prefix(6000)))"
         }
         return "\(fileName) is a \(mimeType) file — orchestra can only read google docs and text files"
@@ -407,15 +441,14 @@ final class GoogleConnectorManager: ObservableObject {
 
     // MARK: - HTTP helpers
 
-    private func getAuthorizedJSON(_ url: URL?, accessToken: String) async throws -> [String: Any]? {
-        guard let url else { return nil }
+    private func getAuthorizedJSON(_ url: URL, accessToken: String) async throws -> [String: Any]? {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         let (responseData, response) = try await session.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200...299).contains(statusCode) else {
-            let errorBody = String(data: responseData, encoding: .utf8) ?? ""
-            OrchestraLog.write("🔐 Google API \(statusCode): \(errorBody.prefix(200))")
+            // Status only: error bodies can echo the user's query or content.
+            OrchestraLog.write("🔐 Google API refused the request (HTTP \(statusCode))")
             if statusCode == 401 || statusCode == 403 {
                 throw ConnectorOAuthError(message: "google refused the request (\(statusCode)); the sign-in may need to be redone, or the API isn't enabled in the user's google cloud project")
             }
@@ -424,8 +457,7 @@ final class GoogleConnectorManager: ObservableObject {
         return try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]
     }
 
-    private func getAuthorizedText(_ url: URL?, accessToken: String) async throws -> String {
-        guard let url else { return "" }
+    private func getAuthorizedText(_ url: URL, accessToken: String) async throws -> String {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         let (responseData, response) = try await session.data(for: request)

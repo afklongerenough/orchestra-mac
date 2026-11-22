@@ -309,7 +309,7 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "forget_fact",
-            "description": "Remove remembered facts about the user when they ask you to forget something. words = words from the fact to forget.",
+            "description": "Remove a remembered fact about the user, only when the user themselves asked to forget something this turn. words = the whole fact's wording; it removes only a fact that matches completely, and the reply says which fact was removed.",
             "parameters": stringParameters(["words"], required: ["words"])
         ],
         [
@@ -329,7 +329,7 @@ final class GeminiLiveSession: NSObject {
         ],
         [
             "name": "take_notes",
-            "description": "Record a lecture or meeting and write summary notes afterwards. action = 'start' (topic = what it's about, optional) or 'stop' (finishes the recording, writes the notes and announces where they are). Notes are saved to ~/Orchestra/Notes or the folder the user picked.",
+            "description": "Record a lecture or meeting and write summary notes afterwards. action = 'start' (only when the user themselves asked for notes this turn; topic = what it's about, optional) or 'stop' (finishes the recording, writes the notes and announces where they are). Notes are saved to ~/Orchestra/Notes or the folder the user picked.",
             "parameters": stringParameters(["action", "topic"], required: ["action"])
         ]
     ]
@@ -525,6 +525,11 @@ final class GeminiLiveSession: NSObject {
         case "remember_fact":
             return toolHandlers.rememberFact(arguments["fact"] as? String ?? "")
         case "forget_fact":
+            // Checked against what the user actually said this turn, not the
+            // model's word: memories are only dropped on the user's request.
+            guard OrchestraMemoryStore.userSpeechAsksToForget(recentUserSpeechText) else {
+                return "the user hasn't asked to forget anything in their own words this turn. don't remove memories; ask them first."
+            }
             return toolHandlers.forgetFact(arguments["words"] as? String ?? "")
         case "add_reminder":
             return await toolHandlers.addReminder(arguments["title"] as? String ?? "", arguments["when"] as? String ?? "")
@@ -535,8 +540,13 @@ final class GeminiLiveSession: NSObject {
         case "my_schedule":
             return await toolHandlers.mySchedule(arguments["day"] as? String ?? "today")
         case "take_notes":
-            return await toolHandlers.takeNotes((arguments["action"] as? String ?? "start").lowercased(),
-                                                arguments["topic"] as? String ?? "")
+            let notesAction = (arguments["action"] as? String ?? "start").lowercased()
+            // Recording the room needs the user's own spoken request this
+            // turn — a model-initiated start is refused.
+            if notesAction != "stop" && !OrchestraNoteTaker.userSpeechAsksToStartNotes(recentUserSpeechText) {
+                return "the user hasn't asked for notes in their own words this turn. don't start recording; ask them if they want notes."
+            }
+            return await toolHandlers.takeNotes(notesAction, arguments["topic"] as? String ?? "")
         default:
             return "unknown tool"
         }

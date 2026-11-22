@@ -15,9 +15,14 @@
 //      (explain …). A replacement is pasted over the selection with cmd+V —
 //      return is never pressed, so nothing is ever sent.
 //    • "explain" answers out loud instead of overwriting the user's text.
+//    • Password managers, secure text fields and Terminal are never read or
+//      pasted over ("i can't use text from there").
+//    • Before pasting, the source app is activated and verified active
+//      (with one retry); if it isn't, the result is spoken instead.
 //
 
 import AppKit
+import ApplicationServices
 import Combine
 import CoreGraphics
 import Foundation
@@ -120,6 +125,15 @@ struct SelectedTextCapture {
     let originalPasteboardItems: [NSPasteboardItem]
 }
 
+/// The result of trying to grab the selection.
+enum SelectedTextCaptureOutcome {
+    case captured(SelectedTextCapture)
+    /// Nothing was selected (or accessibility is off): answer like a normal turn.
+    case nothingSelected
+    /// A password manager, secure field or Terminal: never read or paste there.
+    case blocked
+}
+
 @MainActor
 final class SelectedTextActionRunner {
     enum TransformMode {
@@ -129,12 +143,30 @@ final class SelectedTextActionRunner {
         case speakAnswer
     }
 
+    /// Apps whose text Orchestra never reads or pastes over: password
+    /// managers, the system password/keychain apps, and Terminal (a paste
+    /// there could run a command).
+    private static let deniedAppBundleIdentifiers: Set<String> = [
+        "com.1password.1password", "com.agilebits.onepassword7",
+        "com.bitwarden.desktop",
+        "com.apple.keychainaccess", "com.apple.Passwords",
+        "com.apple.Terminal"
+    ]
+
     private let geminiAPI = GeminiAPI()
 
     /// Copies the current selection with cmd+C and restores the clipboard.
-    /// Nil when nothing was selected (or accessibility is off).
-    func captureSelection() -> SelectedTextCapture? {
-        guard AXIsProcessTrusted() else { return nil }
+    /// Async so the event-tap path never blocks on a sleep. Skips secure
+    /// text fields and the denylisted apps entirely.
+    func captureSelection() async -> SelectedTextCaptureOutcome {
+        guard AXIsProcessTrusted() else { return .nothingSelected }
+        if let frontmostBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           Self.deniedAppBundleIdentifiers.contains(frontmostBundleIdentifier) {
+            return .blocked
+        }
+        if Self.focusedElementIsSecureTextField() {
+            return .blocked
+        }
         let pasteboard = NSPasteboard.general
         let originalPasteboardItems = (pasteboard.pasteboardItems ?? []).map { pasteboardItem -> NSPasteboardItem in
             let itemCopy = NSPasteboardItem()
@@ -150,16 +182,36 @@ final class SelectedTextActionRunner {
         // selection — an empty clipboard means nothing was selected.
         pasteboard.clearContents()
         ScreenControl.pressKeyCombination("cmd+c")
-        usleep(250_000)
+        try? await Task.sleep(nanoseconds: 250_000_000)
         let copiedText = pasteboard.string(forType: .string)
         pasteboard.clearContents()
         if !originalPasteboardItems.isEmpty {
             pasteboard.writeObjects(originalPasteboardItems)
         }
-        guard let copiedText, !copiedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return SelectedTextCapture(selectedText: copiedText,
-                                   sourceApplication: sourceApplication,
-                                   originalPasteboardItems: originalPasteboardItems)
+        guard !Task.isCancelled else { return .nothingSelected }
+        guard let copiedText, !copiedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .nothingSelected }
+        return .captured(SelectedTextCapture(selectedText: copiedText,
+                                             sourceApplication: sourceApplication,
+                                             originalPasteboardItems: originalPasteboardItems))
+    }
+
+    /// True when the focused element is a secure (password) text field.
+    private static func focusedElementIsSecureTextField() -> Bool {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var focusedElementValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedUIElementAttribute as CFString, &focusedElementValue) == .success,
+              let focusedElementValue,
+              CFGetTypeID(focusedElementValue) == AXUIElementGetTypeID() else {
+            return false
+        }
+        let focusedElement = focusedElementValue as! AXUIElement
+        var roleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(focusedElement, kAXRoleAttribute as CFString, &roleValue) == .success,
+              let focusedRole = roleValue as? String else {
+            return false
+        }
+        // The secure text field role ("AXSecureTextField") marks password boxes.
+        return focusedRole == "AXSecureTextField"
     }
 
     /// Asks the model to carry out the spoken instruction on the selection.
@@ -193,17 +245,29 @@ final class SelectedTextActionRunner {
 
     /// Pastes the result over the selection in the app it came from, then
     /// puts the user's original clipboard back. Never presses return.
-    func pasteBack(_ resultText: String, capture: SelectedTextCapture) {
-        if let sourceApplication = capture.sourceApplication,
-           sourceApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+    /// Returns false when the source app can't be brought back to the front
+    /// (the caller then speaks/shows the result instead of pasting into
+    /// whatever app happens to be active).
+    func pasteBack(_ resultText: String, capture: SelectedTextCapture) async -> Bool {
+        guard let sourceApplication = capture.sourceApplication else { return false }
+        if sourceApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             sourceApplication.activate(from: NSRunningApplication.current, options: [])
-            usleep(200_000)
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if !sourceApplication.isActive {
+                // One retry before giving up on the paste.
+                sourceApplication.activate(from: NSRunningApplication.current, options: [.activateAllWindows])
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+        guard sourceApplication.isActive else {
+            OrchestraLog.write("✂️ Selected text: source app isn't active, not pasting")
+            return false
         }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(resultText, forType: .string)
         ScreenControl.pressKeyCombination("cmd+v")
-        usleep(350_000)
+        try? await Task.sleep(nanoseconds: 350_000_000)
         let originalPasteboardItems = capture.originalPasteboardItems
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 600_000_000)
@@ -215,5 +279,6 @@ final class SelectedTextActionRunner {
                 NSPasteboard.general.writeObjects(originalPasteboardItems)
             }
         }
+        return true
     }
 }

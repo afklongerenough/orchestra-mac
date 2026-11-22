@@ -95,7 +95,9 @@ struct ConnectorOAuthServerMetadata {
 }
 
 /// What we keep per connector so the next sign-in/refresh needs no discovery:
-/// the registered client and the endpoints. Not secret (no tokens in here).
+/// the registered client and the endpoints. Not secret — `clientSecret` is a
+/// legacy field only: older builds saved it here (UserDefaults); it is now
+/// migrated into the secrets file and always nil in new records.
 struct ConnectorOAuthClientRecord: Codable {
     let clientID: String
     var clientSecret: String?
@@ -231,8 +233,8 @@ enum ConnectorOAuthFlow {
         guard let statusCode = (response as? HTTPURLResponse)?.statusCode, (200...299).contains(statusCode),
               let tokenJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
               tokenJSON["access_token"] as? String != nil else {
-            let errorBody = String(data: responseData, encoding: .utf8) ?? ""
-            OrchestraLog.write("🔐 OAuth token request refused (\((response as? HTTPURLResponse)?.statusCode ?? 0)): \(errorBody.prefix(200))")
+            // Status only, never the body: token responses can carry secrets.
+            OrchestraLog.write("🔐 OAuth token request refused (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0))")
             throw ConnectorOAuthError(message: "the sign-in server didn't accept the token request (\((response as? HTTPURLResponse)?.statusCode ?? 0))")
         }
         return tokenJSON
@@ -260,8 +262,9 @@ enum ConnectorOAuthFlow {
     }
 }
 
-/// Per-connector sign-in state: client records (UserDefaults), refresh tokens
-/// (secrets file), cached access tokens (memory only).
+/// Per-connector sign-in state: client records (UserDefaults, no secrets),
+/// refresh tokens and any registered client secret (secrets file), cached
+/// access tokens (memory only).
 @MainActor
 final class ConnectorOAuthManager: ObservableObject {
     static let shared = ConnectorOAuthManager()
@@ -273,10 +276,34 @@ final class ConnectorOAuthManager: ObservableObject {
     private var clientRecordsByConnector: [String: ConnectorOAuthClientRecord] = [:]
     private var cachedAccessTokensByConnector: [String: (token: String, expiryDate: Date)] = [:]
 
+    private static func clientSecretName(for connectorIdentifier: String) -> String {
+        "mcp-oauth-client-secret-\(connectorIdentifier)"
+    }
+
     private init() {
         if let savedData = UserDefaults.standard.data(forKey: Self.clientRecordsDefaultsKey),
-           let savedRecords = try? JSONDecoder().decode([String: ConnectorOAuthClientRecord].self, from: savedData) {
+           var savedRecords = try? JSONDecoder().decode([String: ConnectorOAuthClientRecord].self, from: savedData) {
+            // Migrate any client secret an older build left in UserDefaults
+            // into the secrets file, then remove it from the defaults copy.
+            var didMigrateSecrets = false
+            for connectorIdentifier in savedRecords.keys {
+                guard let record = savedRecords[connectorIdentifier],
+                      let legacyClientSecret = record.clientSecret, !legacyClientSecret.isEmpty else { continue }
+                KeychainStore.writeCustomSecret(legacyClientSecret, named: Self.clientSecretName(for: connectorIdentifier))
+                savedRecords[connectorIdentifier] = ConnectorOAuthClientRecord(
+                    clientID: record.clientID,
+                    clientSecret: nil,
+                    authorizationEndpoint: record.authorizationEndpoint,
+                    tokenEndpoint: record.tokenEndpoint,
+                    issuer: record.issuer,
+                    resourceURLText: record.resourceURLText)
+                didMigrateSecrets = true
+            }
             clientRecordsByConnector = savedRecords
+            if didMigrateSecrets {
+                saveClientRecords()
+                OrchestraLog.write("🔐 OAuth: moved saved client secrets out of UserDefaults into the secrets file")
+            }
         }
     }
 
@@ -298,9 +325,14 @@ final class ConnectorOAuthManager: ObservableObject {
                 clientRecord = existingRecord
             } else {
                 clientRecord = try await ConnectorOAuthFlow.registerClient(metadata: metadata)
+                // A registered client secret is a secret: it goes straight to
+                // the secrets file, never into UserDefaults.
+                if let registeredClientSecret = clientRecord.clientSecret, !registeredClientSecret.isEmpty {
+                    KeychainStore.writeCustomSecret(registeredClientSecret, named: Self.clientSecretName(for: connectorIdentifier))
+                }
             }
             clientRecord = ConnectorOAuthClientRecord(clientID: clientRecord.clientID,
-                                                      clientSecret: clientRecord.clientSecret,
+                                                      clientSecret: nil,
                                                       authorizationEndpoint: clientRecord.authorizationEndpoint,
                                                       tokenEndpoint: clientRecord.tokenEndpoint,
                                                       issuer: clientRecord.issuer,
@@ -335,7 +367,9 @@ final class ConnectorOAuthManager: ObservableObject {
                 "code_verifier": codeVerifier,
                 "resource": serverURL.absoluteString
             ]
-            if let clientSecret = clientRecord.clientSecret { tokenFormFields["client_secret"] = clientSecret }
+            if let clientSecret = KeychainStore.readCustomSecret(named: Self.clientSecretName(for: connectorIdentifier)) {
+                tokenFormFields["client_secret"] = clientSecret
+            }
             let tokenJSON = try await ConnectorOAuthFlow.requestTokens(tokenEndpoint: clientRecord.tokenEndpoint, formFields: tokenFormFields)
             guard let accessToken = tokenJSON["access_token"] as? String else { return "the server didn't return a token" }
             if let refreshToken = tokenJSON["refresh_token"] as? String {
@@ -366,7 +400,9 @@ final class ConnectorOAuthManager: ObservableObject {
             "refresh_token": refreshToken,
             "client_id": clientRecord.clientID
         ]
-        if let clientSecret = clientRecord.clientSecret { refreshFormFields["client_secret"] = clientSecret }
+        if let clientSecret = KeychainStore.readCustomSecret(named: Self.clientSecretName(for: connectorIdentifier)) {
+            refreshFormFields["client_secret"] = clientSecret
+        }
         if !clientRecord.resourceURLText.isEmpty { refreshFormFields["resource"] = clientRecord.resourceURLText }
         do {
             let tokenJSON = try await ConnectorOAuthFlow.requestTokens(tokenEndpoint: clientRecord.tokenEndpoint, formFields: refreshFormFields)
@@ -386,6 +422,7 @@ final class ConnectorOAuthManager: ObservableObject {
 
     func signOut(connectorIdentifier: String) {
         KeychainStore.writeCustomSecret("", named: "mcp-oauth-refresh-\(connectorIdentifier)")
+        KeychainStore.writeCustomSecret("", named: Self.clientSecretName(for: connectorIdentifier))
         cachedAccessTokensByConnector[connectorIdentifier] = nil
         clientRecordsByConnector[connectorIdentifier] = nil
         saveClientRecords()

@@ -12,6 +12,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 extension Notification.Name {
@@ -30,6 +31,9 @@ final class MenuBarPanelManager: NSObject {
     private var panel: NSPanel?
     private var clickOutsideMonitor: Any?
     private var dismissPanelObserver: NSObjectProtocol?
+    /// Keeps the red "● Recording" menu bar indicator in sync with the note
+    /// taker, so it's visible the whole time audio is being recorded.
+    private var noteRecordingCancellable: AnyCancellable?
 
     private let companionManager: CompanionManager
     private let panelWidth: CGFloat = 320
@@ -39,6 +43,12 @@ final class MenuBarPanelManager: NSObject {
         self.companionManager = companionManager
         super.init()
         createStatusItem()
+
+        noteRecordingCancellable = OrchestraNoteTaker.shared.$isRecording
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isRecording in
+                self?.updateRecordingIndicator(isRecording: isRecording)
+            }
 
         dismissPanelObserver = NotificationCenter.default.addObserver(
             forName: .clickyDismissPanel,
@@ -69,6 +79,26 @@ final class MenuBarPanelManager: NSObject {
         button.image?.isTemplate = true
         button.action = #selector(statusItemClicked)
         button.target = self
+    }
+
+    /// Red "● Recording" next to the menu bar icon while the note taker
+    /// records, so the user can always see the mic is being captured.
+    private func updateRecordingIndicator(isRecording: Bool) {
+        guard let button = statusItem?.button else { return }
+        if isRecording {
+            statusItem?.length = NSStatusItem.variableLength
+            button.attributedTitle = NSAttributedString(
+                string: " ● Recording",
+                attributes: [
+                    .foregroundColor: NSColor.systemRed,
+                    .font: NSFont.systemFont(ofSize: 11, weight: .semibold)
+                ])
+            button.imagePosition = .imageLeading
+        } else {
+            button.attributedTitle = NSAttributedString(string: "")
+            button.imagePosition = .imageOnly
+            statusItem?.length = NSStatusItem.squareLength
+        }
     }
 
     /// Draws the clicky triangle as a menu bar icon. Uses the same shape

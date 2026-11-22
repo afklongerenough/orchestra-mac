@@ -72,6 +72,18 @@ final class OrchestraNoteTaker: ObservableObject {
         }
     }
 
+    /// True only when the user's OWN spoken words this turn ask for notes.
+    /// A model-emitted [NOTES: start] / take_notes call is never enough on
+    /// its own — recording the room's audio needs the user's clear request.
+    static func userSpeechAsksToStartNotes(_ userSpeech: String) -> Bool {
+        let normalizedSpeech = userSpeech.lowercased()
+        let notesWordsPattern = #"\b(notes?|record|recording|transcribe|transcript)\b"#
+        guard normalizedSpeech.range(of: notesWordsPattern, options: .regularExpression) != nil else { return false }
+        // "stop taking notes" is a stop, not a start; nor is "don't record".
+        let stopOrNegationPattern = #"\b(stop|finish|end|done|cancel|quit|don't|dont|do not|no need|never|without)\b"#
+        return normalizedSpeech.range(of: stopOrNegationPattern, options: .regularExpression) == nil
+    }
+
     // MARK: - Starting
 
     /// Starts recording. Returns a short status line (spoken by the caller).
@@ -141,6 +153,9 @@ final class OrchestraNoteTaker: ObservableObject {
         isRecording = true
         recordingStartDate = startDate
         statusText = "recording"
+        // Audible cue that the mic is now being recorded (the menu bar also
+        // shows a red "● Recording" indicator for the whole session).
+        NSSound(named: "Pop")?.play()
         OrchestraLog.write("📝 Notes: recording started (\(folderName))")
 
         autoStopTask = Task { [weak self] in
@@ -160,6 +175,8 @@ final class OrchestraNoteTaker: ObservableObject {
         isStopping = true
         isRecording = false
         statusText = "writing notes…"
+        // Audible cue that the recording has stopped.
+        NSSound(named: "Glass")?.play()
         autoStopTask?.cancel()
         autoStopTask = nil
 

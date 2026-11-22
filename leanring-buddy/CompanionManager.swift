@@ -71,9 +71,9 @@ final class CompanionManager: ObservableObject {
     let selectedTextShortcutMonitor = SelectedTextShortcutMonitor()
     private let selectedTextActionRunner = SelectedTextActionRunner()
     private var selectedTextTransitionCancellable: AnyCancellable?
-    /// The selection grabbed when the shift+control shortcut was released;
-    /// consumed by the transcript callback that follows.
-    private var pendingSelectedTextCapture: SelectedTextCapture?
+    /// The selection grab started when the shift+control shortcut was
+    /// released; the transcript callback awaits it before acting.
+    private var pendingSelectedTextCaptureTask: Task<SelectedTextCaptureOutcome, Never>?
     private var isSelectedTextSessionActive = false
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
@@ -722,14 +722,16 @@ final class CompanionManager: ObservableObject {
 
     /// Hold shift+control with text selected, speak the instruction, release:
     /// the selection is grabbed on release (modifiers up, so cmd+C is clean),
-    /// and the finalized transcript decides what happens to it.
+    /// and the finalized transcript decides what happens to it. The tap
+    /// callback itself never blocks — the grab runs in its own task.
     private func handleSelectedTextTransition(_ transition: SelectedTextShortcutTransition) {
         switch transition {
         case .pressed:
             guard !isLiveSessionActive, !buddyDictationManager.isDictationInProgress,
                   !showOnboardingVideo, hasAccessibilityPermission else { return }
             isSelectedTextSessionActive = true
-            pendingSelectedTextCapture = nil
+            pendingSelectedTextCaptureTask?.cancel()
+            pendingSelectedTextCaptureTask = nil
 
             transientHideTask?.cancel()
             transientHideTask = nil
@@ -750,17 +752,33 @@ final class CompanionManager: ObservableObject {
                         // Partial transcripts are hidden (waveform-only UI)
                     },
                     submitDraftText: { [weak self] finalTranscript in
-                        guard let self else { return }
-                        self.isSelectedTextSessionActive = false
-                        self.lastTranscript = finalTranscript
-                        self.showCaptionLine(isUserSpeech: true, fullText: finalTranscript)
-                        self.appendChatMessage(isFromUser: true, text: finalTranscript)
-                        if let selectedTextCapture = self.pendingSelectedTextCapture {
-                            self.pendingSelectedTextCapture = nil
-                            self.runSelectedTextAction(instruction: finalTranscript, capture: selectedTextCapture)
-                        } else {
-                            // Nothing was selected: answer like a normal turn.
-                            self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.isSelectedTextSessionActive = false
+                            self.lastTranscript = finalTranscript
+                            self.showCaptionLine(isUserSpeech: true, fullText: finalTranscript)
+                            self.appendChatMessage(isFromUser: true, text: finalTranscript)
+                            let captureOutcome: SelectedTextCaptureOutcome
+                            if let captureTask = self.pendingSelectedTextCaptureTask {
+                                captureOutcome = await captureTask.value
+                            } else {
+                                captureOutcome = .nothingSelected
+                            }
+                            self.pendingSelectedTextCaptureTask = nil
+                            switch captureOutcome {
+                            case .captured(let selectedTextCapture):
+                                self.runSelectedTextAction(instruction: finalTranscript, capture: selectedTextCapture)
+                            case .blocked:
+                                let blockedLine = "i can't use text from there."
+                                self.showCaptionLine(isUserSpeech: false, fullText: blockedLine)
+                                self.appendChatMessage(isFromUser: false, text: blockedLine)
+                                try? await self.speechOutputClient.speakText(blockedLine)
+                                self.voiceState = .idle
+                                self.scheduleTransientHideIfNeeded()
+                            case .nothingSelected:
+                                // Nothing was selected: answer like a normal turn.
+                                self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                            }
                         }
                     }
                 )
@@ -769,21 +787,24 @@ final class CompanionManager: ObservableObject {
             guard isSelectedTextSessionActive else { return }
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
-            // Grab the selection before the transcript finishes finalizing.
-            pendingSelectedTextCapture = selectedTextActionRunner.captureSelection()
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
             if !buddyDictationManager.isDictationInProgress {
                 // A quick tap that never started recording: nothing will submit.
                 isSelectedTextSessionActive = false
-                pendingSelectedTextCapture = nil
                 scheduleTransientHideIfNeeded()
+                return
+            }
+            // Grab the selection while the transcript finishes finalizing.
+            pendingSelectedTextCaptureTask = Task { @MainActor [weak self] in
+                guard let self else { return SelectedTextCaptureOutcome.nothingSelected }
+                return await self.selectedTextActionRunner.captureSelection()
             }
         }
     }
 
     /// Runs the spoken instruction on the captured selection: a replacement
-    /// is pasted back over it, an explanation is spoken. Return is never
-    /// pressed, so nothing is sent.
+    /// is pasted back over it (only once the source app is verified active),
+    /// an explanation is spoken. Return is never pressed, so nothing is sent.
     private func runSelectedTextAction(instruction: String, capture: SelectedTextCapture) {
         currentResponseTask?.cancel()
         speechOutputClient.stopPlayback()
@@ -796,8 +817,11 @@ final class CompanionManager: ObservableObject {
                 let spokenReply: String
                 switch transformResult.mode {
                 case .replaceSelection:
-                    selectedTextActionRunner.pasteBack(transformResult.text, capture: capture)
-                    spokenReply = "done — pasted it back."
+                    let didPasteBack = await selectedTextActionRunner.pasteBack(transformResult.text, capture: capture)
+                    guard !Task.isCancelled else { return }
+                    spokenReply = didPasteBack
+                        ? "done — pasted it back."
+                        : "i couldn't get back to the app you copied from, so here it is: \(transformResult.text)"
                 case .speakAnswer:
                     spokenReply = transformResult.text
                 }
@@ -1315,14 +1339,22 @@ final class CompanionManager: ObservableObject {
                         toolResult: toolResult)
                 }
 
-                // Long-term memory: keep new facts, drop forgotten ones.
+                // Long-term memory: keep new facts; forget only when the user
+                // asked to forget in this same turn, and say what was removed.
                 for rememberFactText in rememberParseResult.tagContents {
                     OrchestraMemoryStore.shared.remember(rememberFactText)
                 }
                 if let forgetWordsText = forgetParseResult.tagContent {
-                    let removedFactCount = OrchestraMemoryStore.shared.forget(matching: forgetWordsText)
-                    if removedFactCount == 0 {
-                        spokenText = "i couldn't find anything like that in my memory."
+                    if OrchestraMemoryStore.userSpeechAsksToForget(transcript) {
+                        let removedFacts = OrchestraMemoryStore.shared.forget(matching: forgetWordsText)
+                        if removedFacts.isEmpty {
+                            spokenText = "i couldn't find that exact fact in my memory."
+                        } else {
+                            spokenText = "forgot: \(removedFacts.joined(separator: "; "))."
+                        }
+                    } else {
+                        OrchestraLog.write("🧠 Memory: model asked to forget but the user didn't — keeping everything")
+                        spokenText = "i'll only forget things when you ask me to."
                     }
                 }
 
@@ -1353,21 +1385,26 @@ final class CompanionManager: ObservableObject {
                         toolResult: scheduleText)
                 }
 
-                // Lecture/meeting notes. On a successful stop the save location
-                // is announced separately when the summary is written, so the
-                // spoken line here stays the model's own ("stopping now").
+                // Lecture/meeting notes. Recording only starts when the user's
+                // own words this turn asked for it — a model-emitted tag alone
+                // is never enough. On a successful stop the save location is
+                // announced separately when the summary is written.
                 if let notesCommandText = notesParseResult.tagContent {
                     let notesPieces = notesCommandText.split(separator: " ", maxSplits: 1).map(String.init)
                     let notesAction = notesPieces.first?.lowercased() ?? "start"
                     let notesTopicHint = notesPieces.count > 1 ? notesPieces[1] : ""
-                    let notesOutcome: (succeeded: Bool, message: String)
                     if notesAction == "stop" {
-                        notesOutcome = await OrchestraNoteTaker.shared.stopNotes()
+                        let stopOutcome = await OrchestraNoteTaker.shared.stopNotes()
+                        guard !Task.isCancelled else { return }
+                        if !stopOutcome.succeeded { spokenText = stopOutcome.message }
+                    } else if OrchestraNoteTaker.userSpeechAsksToStartNotes(transcript) {
+                        let startOutcome = await OrchestraNoteTaker.shared.startNotes(topicHint: notesTopicHint)
+                        guard !Task.isCancelled else { return }
+                        if !startOutcome.succeeded { spokenText = startOutcome.message }
                     } else {
-                        notesOutcome = await OrchestraNoteTaker.shared.startNotes(topicHint: notesTopicHint)
+                        OrchestraLog.write("📝 Notes: model asked to start but the user didn't — not recording")
+                        spokenText = "i didn't start recording — say \"take notes on this\" if you want me to."
                     }
-                    guard !Task.isCancelled else { return }
-                    if !notesOutcome.succeeded { spokenText = notesOutcome.message }
                 }
 
                 if let macJobBrief = macJobParseResult.tagContent {
@@ -1757,8 +1794,10 @@ final class CompanionManager: ObservableObject {
                     : "not kept (empty, duplicate, or it looked like a secret or a standing order)"
             },
             forgetFact: { wordsText in
-                let removedFactCount = OrchestraMemoryStore.shared.forget(matching: wordsText)
-                return removedFactCount > 0 ? "forgot \(removedFactCount) fact(s)" : "nothing in memory matched those words"
+                let removedFacts = OrchestraMemoryStore.shared.forget(matching: wordsText)
+                return removedFacts.isEmpty
+                    ? "no whole fact matched those words; nothing was removed"
+                    : "forgot: \(removedFacts.joined(separator: "; "))"
             },
             addReminder: { title, whenText in
                 let reminderOutcome = await MacCalendarReminders.shared.addReminder(title: title, whenText: whenText)
