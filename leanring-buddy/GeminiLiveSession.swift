@@ -645,6 +645,28 @@ final class GeminiLiveSession: NSObject {
     /// Echo cancellation (voice processing) first; some Macs/headsets can't
     /// start with it, so retry once without it (headphones recommended then).
     private func startAudioWithFallback() throws {
+        // Bluetooth headphones (AirPods…): listen with the Mac's built-in mic so
+        // the headphones stay in high-quality mode and music keeps playing. The
+        // sound is in the user's ears, so there's no echo to cancel or mute for.
+        if PreferredMicrophone.builtInMicrophoneReplacingBluetooth() != nil {
+            do {
+                try startAudio(useVoiceProcessing: false, useBuiltInMicrophone: true)
+                isEchoCancellationActive = true
+                OrchestraLog.write("🎙️ Live: microphone started (built-in mic, Bluetooth headphones for sound)")
+                return
+            } catch {
+                OrchestraLog.write("🎙️ Live: built-in mic failed (\(error)); trying the headphones' mic")
+                stopAudio()
+            }
+        }
+        // A Bluetooth headset's own mic: macOS's echo cancellation can hand back
+        // pure silence from it, and with headphones there's no echo anyway.
+        if PreferredMicrophone.defaultInputIsBluetooth {
+            try startAudio(useVoiceProcessing: false)
+            isEchoCancellationActive = true
+            OrchestraLog.write("🎙️ Live: microphone started (Bluetooth headset mic, no echo cancellation needed)")
+            return
+        }
         do {
             try startAudio(useVoiceProcessing: true)
             isEchoCancellationActive = true
@@ -658,7 +680,7 @@ final class GeminiLiveSession: NSObject {
         }
     }
 
-    private func startAudio(useVoiceProcessing: Bool) throws {
+    private func startAudio(useVoiceProcessing: Bool, useBuiltInMicrophone: Bool = false) throws {
         // Never leave an earlier engine running with a hot mic.
         stopAudio()
         audioEngine = AVAudioEngine()
@@ -667,6 +689,11 @@ final class GeminiLiveSession: NSObject {
         // initializes the echo canceller on the output node.
         _ = audioEngine.mainMixerNode
         _ = audioEngine.outputNode
+        if useBuiltInMicrophone {
+            guard PreferredMicrophone.applyPreferredMicrophone(to: audioEngine, logLabel: "Live") else {
+                throw NSError(domain: "GeminiLive", code: 3, userInfo: [NSLocalizedDescriptionKey: "couldn't switch to the built-in mic"])
+            }
+        }
         let inputNode = audioEngine.inputNode
         if useVoiceProcessing {
             try inputNode.setVoiceProcessingEnabled(true)

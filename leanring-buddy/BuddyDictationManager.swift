@@ -546,6 +546,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
+        // Bluetooth headphones: the Mac's built-in mic (keeps music playing).
+        PreferredMicrophone.applyPreferredMicrophone(to: audioEngine, logLabel: "Push-to-talk")
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
 

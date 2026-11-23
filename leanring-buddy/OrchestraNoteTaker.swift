@@ -153,6 +153,7 @@ final class OrchestraNoteTaker: ObservableObject {
 
         if audioSource.usesMicrophone {
             let newAudioEngine = AVAudioEngine()
+            PreferredMicrophone.applyPreferredMicrophone(to: newAudioEngine, logLabel: "Notes")
             let inputNode = newAudioEngine.inputNode
             let inputFormat = inputNode.outputFormat(forBus: 0)
             guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {

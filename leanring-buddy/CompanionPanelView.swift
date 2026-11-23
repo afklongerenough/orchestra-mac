@@ -33,6 +33,7 @@ struct CompanionPanelView: View {
     @ObservedObject private var memoryStore = OrchestraMemoryStore.shared
     @ObservedObject private var noteTaker = OrchestraNoteTaker.shared
     @State private var notesAudioSourceSelection = NotesAudioSource.current
+    @State private var usesBuiltInMicWithBluetooth = PreferredMicrophone.usesBuiltInMicWithBluetoothHeadphones
     @State private var googleClientIDInput: String = ""
     @State private var googleClientSecretInput: String = ""
     @State private var googleAccountStatusText: String = ""
@@ -93,6 +94,8 @@ struct CompanionPanelView: View {
                     liveModeToggleRow
                         .padding(.horizontal, 16)
                     wakeWordToggleRow
+                        .padding(.horizontal, 16)
+                    bluetoothMicrophoneToggleRow
                         .padding(.horizontal, 16)
 
                     voicePickerRow
@@ -993,6 +996,42 @@ struct CompanionPanelView: View {
             Toggle("", isOn: Binding(
                 get: { companionManager.isWakeWordEnabled },
                 set: { companionManager.setWakeWordEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .controlSize(.small)
+            .pointerCursor()
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// AirPods & other Bluetooth headphones: listen with the Mac's mic instead.
+    private var bluetoothMicrophoneToggleRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Mac mic with AirPods")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text(usesBuiltInMicWithBluetooth
+                     ? "With Bluetooth headphones, Orchestra listens through the Mac's mic, so music keeps playing in full quality"
+                     : "Off: Orchestra uses the headphones' own mic (music may pause or sound worse while it listens)")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { usesBuiltInMicWithBluetooth },
+                set: { newValue in
+                    PreferredMicrophone.usesBuiltInMicWithBluetoothHeadphones = newValue
+                    usesBuiltInMicWithBluetooth = newValue
+                    // The always-on wake word listener picks its mic when it
+                    // starts: restart it so the change applies right away.
+                    if companionManager.isWakeWordEnabled {
+                        companionManager.setWakeWordEnabled(false)
+                        companionManager.setWakeWordEnabled(true)
+                    }
+                }
             ))
             .toggleStyle(.switch)
             .labelsHidden()

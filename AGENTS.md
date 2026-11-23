@@ -86,6 +86,7 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `MacCalendarReminders.swift` | ~247 | EventKit bridge: add reminders (with alarm) and calendar events, read a day's schedule; forgiving date parsing for model output. |
 | `OrchestraNoteTaker.swift` | ~421 | Lecture/meeting recorder: AVAudioEngine + Apple Speech segments, WAV + transcript saving, Gemini summary to ~/Orchestra/Notes or a picked folder, 2-hour cap, finished announcement. |
 | `NotesMacAudioCapture.swift` | ~210 | Notes audio sources: `NotesAudioSource` setting, ScreenCaptureKit capture of the Mac's audio output, resampler and mic + Mac mixer. |
+| `PreferredMicrophone.swift` | ~140 | With Bluetooth headphones (AirPods), every Orchestra mic (push-to-talk, Live, wake word, notes) uses the Mac's built-in mic so the headphones stay in high-quality mode and music keeps playing; menu toggle "Mac mic with AirPods". |
 | `SelectedTextActions.swift` | ~219 | Shift+control shortcut monitor, selection capture with clipboard restore, Gemini rewrite/explain/translate, paste-back (never presses return). |
 | `GeminiLiveSession.swift` | ~881 | Gemini Live two-way voice: websocket protocol, mic echo handling, screen frames, and the Live tool surface (jobs, connectors, reminders/calendar, notes, memory, takeover). |
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |

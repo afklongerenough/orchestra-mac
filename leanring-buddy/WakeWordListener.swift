@@ -37,6 +37,9 @@ final class WakeWordListener {
     private var recognitionSessionTimer: Timer?
     private let loudnessGate = WakeWordLoudnessGate()
     private(set) var isListening = false
+    /// Restarts listening when headphones connect/disconnect (the engine stops,
+    /// and the right mic may now be a different one).
+    private var audioConfigurationObserver: NSObjectProtocol?
 
     /// Words the recognizer might hear for "clicky".
     private static let wakePhrasePattern = #"\b(hey|hi|hay|okay|ok)\s*,?\s*(clicky|clickie|clicki|cliquey|klicky|klickie|clickey|clicky's|kliky)\b"#
@@ -89,6 +92,9 @@ final class WakeWordListener {
         }
 
         let newAudioEngine = AVAudioEngine()
+        // Bluetooth headphones: always-on listening must not hold the AirPods
+        // mic open (that keeps them in low-quality headset mode and pauses music).
+        PreferredMicrophone.applyPreferredMicrophone(to: newAudioEngine, logLabel: "Wake word")
         let inputNode = newAudioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
@@ -127,6 +133,20 @@ final class WakeWordListener {
         }
         audioEngine = newAudioEngine
         isListening = true
+        audioConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: newAudioEngine, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isListening else { return }
+                OrchestraLog.write("👂 Wake word: audio device changed, restarting")
+                self.stopListening(statusAfterStopping: "audio device changed")
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                // Only if nothing else (Live, push-to-talk) took over meanwhile.
+                if !self.isListening && self.statusText == "audio device changed" {
+                    self.startListening()
+                }
+            }
+        }
         if usesDedicatedModel {
             statusText = "listening for \"hey clicky\" (wake-word model, on this Mac only)"
         } else {
@@ -147,6 +167,10 @@ final class WakeWordListener {
     }
 
     func stopListening(statusAfterStopping: String = "paused") {
+        if let audioConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioConfigurationObserver)
+            self.audioConfigurationObserver = nil
+        }
         recognitionSessionTimer?.invalidate()
         recognitionSessionTimer = nil
         endRecognitionSession()
