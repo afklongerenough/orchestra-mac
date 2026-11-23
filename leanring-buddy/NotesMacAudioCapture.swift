@@ -140,9 +140,27 @@ final class NotesAudioMixer: @unchecked Sendable {
     /// How many Mac-audio frames made it through, so the note taker can tell
     /// "nothing playing / conversion failing" apart from a working capture.
     private var receivedMacAudioFrameTotal = 0
+    private var unconvertibleMacAudioBufferTotal = 0
+    private var lastUnconvertibleFormatDescription = ""
+    /// Once the notes stop, nothing (not even a capture macOS hasn't torn
+    /// down yet) can add audio any more.
+    private var isAcceptingAudio = true
+
     var receivedMacAudioFrameCount: Int {
         lock.lock(); defer { lock.unlock() }
         return receivedMacAudioFrameTotal
+    }
+
+    /// For the log: Mac-audio buffers that couldn't be converted, and their format.
+    var unconvertibleMacAudioSummary: String? {
+        lock.lock(); defer { lock.unlock() }
+        guard unconvertibleMacAudioBufferTotal > 0 else { return nil }
+        return "\(unconvertibleMacAudioBufferTotal) mac audio buffers couldn't be converted (format: \(lastUnconvertibleFormatDescription.prefix(160)))"
+    }
+
+    func stopAcceptingAudio() {
+        lock.lock(); defer { lock.unlock() }
+        isAcceptingAudio = false
     }
     private let mixesMacAudioIntoMicrophone: Bool
     private let deliverMixedBuffer: @Sendable (AVAudioPCMBuffer) -> Void
@@ -157,23 +175,35 @@ final class NotesAudioMixer: @unchecked Sendable {
     /// Called on the microphone tap's audio thread.
     func appendMicrophoneBuffer(_ microphoneBuffer: AVAudioPCMBuffer) {
         guard let resampledMicrophoneBuffer = microphoneResampler.convert(microphoneBuffer) else { return }
+        lock.lock()
+        guard isAcceptingAudio else { lock.unlock(); return }
         if mixesMacAudioIntoMicrophone, let microphoneSamples = resampledMicrophoneBuffer.floatChannelData?[0] {
-            lock.lock()
-            let mixedSampleCount = min(Int(resampledMicrophoneBuffer.frameLength), pendingMacAudioSamples.count)
-            for sampleIndex in 0..<mixedSampleCount {
-                let summedSample = (microphoneSamples[sampleIndex] + pendingMacAudioSamples[sampleIndex]) * Self.mixedSourceGain
+            // The same gain on every mic sample (with or without Mac audio
+            // under it), so the mic level never jumps when Mac audio starts.
+            let microphoneFrameCount = Int(resampledMicrophoneBuffer.frameLength)
+            let mixedSampleCount = min(microphoneFrameCount, pendingMacAudioSamples.count)
+            for sampleIndex in 0..<microphoneFrameCount {
+                let macAudioSample = sampleIndex < mixedSampleCount ? pendingMacAudioSamples[sampleIndex] : 0
+                let summedSample = (microphoneSamples[sampleIndex] + macAudioSample) * Self.mixedSourceGain
                 microphoneSamples[sampleIndex] = max(-1, min(1, summedSample))
             }
             pendingMacAudioSamples.removeFirst(mixedSampleCount)
-            lock.unlock()
         }
+        lock.unlock()
         deliverMixedBuffer(resampledMicrophoneBuffer)
     }
 
     /// Called on the ScreenCaptureKit audio queue.
     func appendMacAudioBuffer(_ macAudioBuffer: AVAudioPCMBuffer) {
-        guard let resampledMacAudioBuffer = macAudioResampler.convert(macAudioBuffer) else { return }
+        guard let resampledMacAudioBuffer = macAudioResampler.convert(macAudioBuffer) else {
+            lock.lock()
+            unconvertibleMacAudioBufferTotal += 1
+            lastUnconvertibleFormatDescription = macAudioBuffer.format.description
+            lock.unlock()
+            return
+        }
         lock.lock()
+        guard isAcceptingAudio else { lock.unlock(); return }
         receivedMacAudioFrameTotal += Int(resampledMacAudioBuffer.frameLength)
         lock.unlock()
         guard mixesMacAudioIntoMicrophone else {
@@ -182,6 +212,7 @@ final class NotesAudioMixer: @unchecked Sendable {
         }
         guard let macAudioSamples = resampledMacAudioBuffer.floatChannelData?[0] else { return }
         lock.lock()
+        guard isAcceptingAudio else { lock.unlock(); return }
         pendingMacAudioSamples.append(contentsOf: UnsafeBufferPointer(start: macAudioSamples, count: Int(resampledMacAudioBuffer.frameLength)))
         if pendingMacAudioSamples.count > Self.maximumPendingMacAudioSamples {
             pendingMacAudioSamples.removeFirst(pendingMacAudioSamples.count - Self.maximumPendingMacAudioSamples)
@@ -216,8 +247,9 @@ final class NotesMacAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
     private var stream: SCStream?
     private let sampleHandlerQueue = DispatchQueue(label: "com.orchestra.notes.mac-audio")
     private let onAudioBuffer: @Sendable (AVAudioPCMBuffer) -> Void
-    /// Called (on any thread) if macOS stops the capture, e.g. permission revoked.
-    var onStoppedWithError: (@Sendable (Error) -> Void)?
+    /// Called (on any thread) if macOS stops the capture, e.g. permission
+    /// revoked; passes the capture so a stale one can be told apart.
+    var onStoppedWithError: (@Sendable (NotesMacAudioCapture, Error) -> Void)?
 
     init(onAudioBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
         self.onAudioBuffer = onAudioBuffer
@@ -245,10 +277,16 @@ final class NotesMacAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
         stream = newStream
     }
 
+    /// Stops the capture and waits until every buffer already queued on the
+    /// sample queue has been handed on, so nothing arrives after this returns.
     func stop() async {
-        guard let stream else { return }
-        self.stream = nil
-        try? await stream.stopCapture()
+        if let stream {
+            self.stream = nil
+            try? await stream.stopCapture()
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sampleHandlerQueue.async { continuation.resume() }
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
@@ -258,7 +296,7 @@ final class NotesMacAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @u
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        onStoppedWithError?(error)
+        onStoppedWithError?(self, error)
     }
 
     private static func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {

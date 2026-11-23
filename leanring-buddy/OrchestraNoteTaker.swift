@@ -63,6 +63,7 @@ final class OrchestraNoteTaker: ObservableObject {
     private var audioMixer: NotesAudioMixer?
     private var macAudioCapture: NotesMacAudioCapture?
     private var macAudioRestartAttemptCount = 0
+    private var isRestartingMacAudioCapture = false
     private var macAudioHealthCheckTask: Task<Void, Never>?
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -210,6 +211,9 @@ final class OrchestraNoteTaker: ObservableObject {
                 if newAudioMixer.receivedMacAudioFrameCount == 0 {
                     OrchestraLog.write("📝 Notes: no mac audio after 10 s (nothing playing, or the capture isn't delivering)")
                 }
+                if let unconvertibleSummary = newAudioMixer.unconvertibleMacAudioSummary {
+                    OrchestraLog.write("📝 Notes: \(unconvertibleSummary)")
+                }
             }
         }
         statusText = "recording"
@@ -233,10 +237,10 @@ final class OrchestraNoteTaker: ObservableObject {
         let newMacAudioCapture = NotesMacAudioCapture(onAudioBuffer: { [weak audioMixer] macAudioBuffer in
             audioMixer?.appendMacAudioBuffer(macAudioBuffer)
         })
-        newMacAudioCapture.onStoppedWithError = { [weak self] captureError in
+        newMacAudioCapture.onStoppedWithError = { [weak self] stoppedCapture, captureError in
             Task { @MainActor [weak self] in
                 OrchestraLog.write("📝 Notes: mac audio capture stopped: \(captureError.localizedDescription)")
-                await self?.restartMacAudioCaptureAfterStop()
+                await self?.restartMacAudioCaptureAfterStop(stoppedCapture: stoppedCapture)
             }
         }
         try await newMacAudioCapture.start()
@@ -246,8 +250,15 @@ final class OrchestraNoteTaker: ObservableObject {
     /// macOS can stop the capture mid-lecture (screen lock, display sleep,
     /// resolution change). Try to pick it back up; if that keeps failing, say
     /// so out loud instead of quietly recording nothing.
-    private func restartMacAudioCaptureAfterStop() async {
-        guard isRecording, !isStopping, let audioMixer else { return }
+    private func restartMacAudioCaptureAfterStop(stoppedCapture: NotesMacAudioCapture) async {
+        // Always make sure the stopped capture is really gone.
+        await stoppedCapture.stop()
+        // A late error from an old capture must not touch the current one, and
+        // only one restart runs at a time.
+        guard stoppedCapture === macAudioCapture, !isRestartingMacAudioCapture,
+              isRecording, !isStopping, let audioMixer else { return }
+        isRestartingMacAudioCapture = true
+        defer { isRestartingMacAudioCapture = false }
         macAudioCapture = nil
         while isRecording && !isStopping && macAudioRestartAttemptCount < 5 {
             macAudioRestartAttemptCount += 1
@@ -255,7 +266,15 @@ final class OrchestraNoteTaker: ObservableObject {
             guard isRecording, !isStopping else { return }
             do {
                 try await startMacAudioCapture(into: audioMixer)
+                // Notes stopped while it was starting: stop it again right away.
+                if !isRecording || isStopping, let restartedCapture = macAudioCapture {
+                    macAudioCapture = nil
+                    await restartedCapture.stop()
+                    return
+                }
                 OrchestraLog.write("📝 Notes: mac audio capture restarted")
+                // Each recovered drop gets a fresh budget; only 5 failures in a row give up.
+                macAudioRestartAttemptCount = 0
                 return
             } catch {
                 OrchestraLog.write("📝 Notes: mac audio restart \(macAudioRestartAttemptCount) failed: \(error.localizedDescription)")
@@ -293,6 +312,12 @@ final class OrchestraNoteTaker: ObservableObject {
             await macAudioCapture.stop()
         }
         audioMixer?.flushPendingMacAudio()
+        // From here on nothing reaches the transcript or the WAV (so no audio
+        // can be appended after endAudio), even from a capture still shutting down.
+        audioMixer?.stopAcceptingAudio()
+        if let unconvertibleSummary = audioMixer?.unconvertibleMacAudioSummary {
+            OrchestraLog.write("📝 Notes: \(unconvertibleSummary)")
+        }
 
         // Let Apple Speech finish the last segment before tearing down.
         audioSink?.endAudio()
@@ -445,6 +470,7 @@ final class OrchestraNoteTaker: ObservableObject {
             Task { await macAudioCapture.stop() }
         }
         macAudioCapture = nil
+        audioMixer?.stopAcceptingAudio()
         audioMixer = nil
         macAudioHealthCheckTask?.cancel()
         macAudioHealthCheckTask = nil
@@ -548,6 +574,8 @@ private final class NoteAudioSink: @unchecked Sendable {
     func endAudio() {
         lock.lock(); defer { lock.unlock() }
         recognitionRequest?.endAudio()
+        // Audio after endAudio() isn't allowed; later buffers only go to the WAV.
+        recognitionRequest = nil
     }
 
     func takeRecordedPCM16Data() -> Data {
