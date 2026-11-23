@@ -8,6 +8,7 @@
 //
 
 import AVFoundation
+import Combine
 import SwiftUI
 
 struct CompanionPanelView: View {
@@ -50,14 +51,17 @@ struct CompanionPanelView: View {
     /// Height of everything inside the scroll area, measured each layout.
     @State private var scrollContentHeight: CGFloat = 0
     /// Height of the parts that don't scroll (header, dividers, update row, footer).
-    @State private var fixedChromeHeight: CGFloat = 0
+    /// Starts at a typical value so the first layout (before it's measured)
+    /// already leaves room for the footer.
+    @State private var fixedChromeHeight: CGFloat = 140
     @ObservedObject private var panelLayout = CompanionPanelLayout.shared
 
     /// The scroll area gets what's left of the panel's height limit (set by
     /// MenuBarPanelManager from the screen the menu bar icon is on) after the
     /// parts that don't scroll.
     private var maximumScrollAreaHeight: CGFloat {
-        max(160, panelLayout.maximumPanelHeight - fixedChromeHeight)
+        // No minimum: on a very short screen the footer must still fit.
+        max(1, panelLayout.maximumPanelHeight - fixedChromeHeight)
     }
 
     /// Before the first measurement, assume the content is as tall as allowed,

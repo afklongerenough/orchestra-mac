@@ -247,7 +247,10 @@ final class MenuBarPanelManager: NSObject {
         // The limit comes from the screen the menu bar icon is on; the panel's
         // middle scrolls within it. Setting it lets SwiftUI size the scroll area
         // before we read the fitting size.
-        let availableScreenHeight = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        // If the icon's screen isn't known right now (display change), keep the
+        // panel's current screen, never the keyboard-focus screen.
+        guard let menuBarScreen = buttonWindow.screen ?? panel.screen else { return }
+        let availableScreenHeight = menuBarScreen.visibleFrame.height
         let maximumPanelHeight = availableScreenHeight - gapBelowMenuBar - 8
         if abs(CompanionPanelLayout.shared.maximumPanelHeight - maximumPanelHeight) > 0.5 {
             CompanionPanelLayout.shared.maximumPanelHeight = maximumPanelHeight
@@ -260,10 +263,14 @@ final class MenuBarPanelManager: NSObject {
         let panelOriginX = statusItemFrame.midX - (panelWidth / 2)
         let panelOriginY = statusItemFrame.minY - actualPanelHeight - gapBelowMenuBar
 
-        panel.setFrame(
-            NSRect(x: panelOriginX, y: panelOriginY, width: panelWidth, height: actualPanelHeight),
-            display: true
-        )
+        let newPanelFrame = NSRect(x: panelOriginX, y: panelOriginY, width: panelWidth, height: actualPanelHeight)
+        // Don't move the panel under the user's cursor when nothing changed.
+        let currentPanelFrame = panel.frame
+        let frameIsUnchanged = abs(currentPanelFrame.minX - newPanelFrame.minX) < 0.5
+            && abs(currentPanelFrame.minY - newPanelFrame.minY) < 0.5
+            && abs(currentPanelFrame.height - newPanelFrame.height) < 0.5
+        guard !frameIsUnchanged || !panel.isVisible else { return }
+        panel.setFrame(newPanelFrame, display: true)
     }
 
     // MARK: - Click Outside Dismissal
