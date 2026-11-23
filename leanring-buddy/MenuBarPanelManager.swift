@@ -249,7 +249,9 @@ final class MenuBarPanelManager: NSObject {
         // before we read the fitting size.
         // If the icon's screen isn't known right now (display change), keep the
         // panel's current screen, never the keyboard-focus screen.
-        guard let menuBarScreen = buttonWindow.screen ?? panel.screen else { return }
+        // Last resort (right after launch neither may be known yet): the screen
+        // with the menu bar, which is always the first one.
+        guard let menuBarScreen = buttonWindow.screen ?? panel.screen ?? NSScreen.screens.first else { return }
         let availableScreenHeight = menuBarScreen.visibleFrame.height
         let maximumPanelHeight = availableScreenHeight - gapBelowMenuBar - 8
         if abs(CompanionPanelLayout.shared.maximumPanelHeight - maximumPanelHeight) > 0.5 {
