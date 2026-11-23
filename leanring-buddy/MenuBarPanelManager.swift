@@ -31,6 +31,7 @@ final class MenuBarPanelManager: NSObject {
     private var panel: NSPanel?
     private var clickOutsideMonitor: Any?
     private var dismissPanelObserver: NSObjectProtocol?
+    private var panelContentHeightObserver: NSObjectProtocol?
     /// Keeps the red "● Recording" menu bar indicator in sync with the note
     /// taker, so it's visible the whole time audio is being recorded.
     private var noteRecordingCancellable: AnyCancellable?
@@ -60,11 +61,27 @@ final class MenuBarPanelManager: NSObject {
         ) { [weak self] _ in
             self?.hidePanel()
         }
+
+        // Re-fit the panel when its content grows or shrinks while it's open.
+        panelContentHeightObserver = NotificationCenter.default.addObserver(
+            forName: .orchestraPanelContentHeightChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // Next run-loop turn: not in the middle of a SwiftUI layout pass.
+            DispatchQueue.main.async {
+                guard let self, self.panel?.isVisible == true else { return }
+                self.positionPanelBelowStatusItem()
+            }
+        }
     }
 
     deinit {
         if let monitor = clickOutsideMonitor {
             NSEvent.removeMonitor(monitor)
+        }
+        if let observer = panelContentHeightObserver {
+            NotificationCenter.default.removeObserver(observer)
         }
         if let observer = dismissPanelObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -218,7 +235,10 @@ final class MenuBarPanelManager: NSObject {
         // Calculate the panel's content height from the hosting view's fitting size
         // so the panel snugly wraps the SwiftUI content instead of using a fixed height.
         let fittingSize = panel.contentView?.fittingSize ?? CGSize(width: panelWidth, height: panelHeight)
-        let actualPanelHeight = fittingSize.height
+        // Never taller than the screen below the menu bar (the middle of the
+        // panel scrolls instead).
+        let availableScreenHeight = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.height ?? fittingSize.height
+        let actualPanelHeight = min(fittingSize.height, availableScreenHeight - gapBelowMenuBar - 4)
 
         // Horizontally center the panel beneath the status item icon
         let panelOriginX = statusItemFrame.midX - (panelWidth / 2)

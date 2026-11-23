@@ -47,6 +47,108 @@ struct CompanionPanelView: View {
     @State private var hasOpenCodeKeySaved: Bool = KeychainStore.read(.openCodeAPIKey) != nil
     @State private var spotifyClientSecretInput: String = ""
 
+    /// Height of everything inside the scroll area, measured each layout.
+    @State private var scrollContentHeight: CGFloat = 0
+
+    /// The scroll area may use the screen's height minus room for the header,
+    /// the footer and the menu bar gap.
+    private var maximumScrollAreaHeight: CGFloat {
+        let visibleScreenHeight = NSScreen.main?.visibleFrame.height ?? 800
+        return max(240, visibleScreenHeight - 190)
+    }
+
+    @ViewBuilder
+    private var scrollablePanelContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+                permissionsCopySection
+                    .padding(.top, 16)
+                    .padding(.horizontal, 16)
+
+                if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 12)
+
+                    brainPickerRow
+                        .padding(.horizontal, 16)
+
+                    if !(brainProviderRawValue == BrainProvider.opencodeGo.rawValue && hasOpenCodeKeySaved) {
+                        modelPickerRow
+                            .padding(.horizontal, 16)
+                    }
+
+                    liveModeToggleRow
+                        .padding(.horizontal, 16)
+                    wakeWordToggleRow
+                        .padding(.horizontal, 16)
+
+                    voicePickerRow
+                        .padding(.horizontal, 16)
+
+                    languageRows
+                        .padding(.horizontal, 16)
+
+                    screenPrivacyRows
+                        .padding(.horizontal, 16)
+                }
+
+                if !companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 16)
+
+                    settingsSection
+                        .padding(.horizontal, 16)
+                }
+
+                if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 16)
+
+                    startButton
+                        .padding(.horizontal, 16)
+                }
+
+                // Show Clicky toggle — hidden for now
+                // if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                //     Spacer()
+                //         .frame(height: 16)
+                //
+                //     showClickyCursorToggleRow
+                //         .padding(.horizontal, 16)
+                // }
+
+                if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 16)
+
+                    OrchestraJobsListView(orchestraJobManager: companionManager.orchestraJobManager)
+                        .padding(.horizontal, 16)
+
+                    agentsSection
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+
+                    memoryRow
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+
+                    notesSection
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+
+                    selectedTextHintRow
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+
+                    Spacer()
+                        .frame(height: 12)
+
+                    connectionSettingsSection
+                        .padding(.horizontal, 16)
+                }
+
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             panelHeader
@@ -54,90 +156,23 @@ struct CompanionPanelView: View {
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
 
-            permissionsCopySection
-                .padding(.top, 16)
-                .padding(.horizontal, 16)
-
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 12)
-
-                brainPickerRow
-                    .padding(.horizontal, 16)
-
-                if !(brainProviderRawValue == BrainProvider.opencodeGo.rawValue && hasOpenCodeKeySaved) {
-                    modelPickerRow
-                        .padding(.horizontal, 16)
-                }
-
-                liveModeToggleRow
-                    .padding(.horizontal, 16)
-                wakeWordToggleRow
-                    .padding(.horizontal, 16)
-
-                voicePickerRow
-                    .padding(.horizontal, 16)
-
-                languageRows
-                    .padding(.horizontal, 16)
-
-                screenPrivacyRows
-                    .padding(.horizontal, 16)
+            // Everything between the header and the footer scrolls, so the
+            // panel never runs off the bottom of the screen.
+            ScrollView(.vertical, showsIndicators: true) {
+                scrollablePanelContent
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        GeometryReader { contentGeometry in
+                            Color.clear.preference(key: PanelScrollContentHeightKey.self, value: contentGeometry.size.height)
+                        }
+                    )
             }
-
-            if !companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                settingsSection
-                    .padding(.horizontal, 16)
-            }
-
-            if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                startButton
-                    .padding(.horizontal, 16)
-            }
-
-            // Show Clicky toggle — hidden for now
-            // if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            //     Spacer()
-            //         .frame(height: 16)
-            //
-            //     showClickyCursorToggleRow
-            //         .padding(.horizontal, 16)
-            // }
-
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                OrchestraJobsListView(orchestraJobManager: companionManager.orchestraJobManager)
-                    .padding(.horizontal, 16)
-
-                agentsSection
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-
-                memoryRow
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-
-                notesSection
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-
-                selectedTextHintRow
-                    .padding(.horizontal, 16)
-                    .padding(.top, 6)
-
-                Spacer()
-                    .frame(height: 12)
-
-                connectionSettingsSection
-                    .padding(.horizontal, 16)
+            .frame(height: min(max(scrollContentHeight, 1), maximumScrollAreaHeight))
+            .onPreferenceChange(PanelScrollContentHeightKey.self) { measuredContentHeight in
+                guard abs(measuredContentHeight - scrollContentHeight) > 0.5 else { return }
+                scrollContentHeight = measuredContentHeight
+                // The panel sizes itself to its content: let it re-measure.
+                NotificationCenter.default.post(name: .orchestraPanelContentHeightChanged, object: nil)
             }
 
             Spacer()
@@ -1654,4 +1689,19 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+
+/// Carries the measured height of the panel's scrollable content up to the panel.
+private struct PanelScrollContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+extension Notification.Name {
+    /// Posted when the panel's content height changes, so MenuBarPanelManager
+    /// can resize the panel (it sizes to its content, up to the screen height).
+    static let orchestraPanelContentHeightChanged = Notification.Name("orchestraPanelContentHeightChanged")
 }
