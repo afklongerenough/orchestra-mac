@@ -49,12 +49,22 @@ struct CompanionPanelView: View {
 
     /// Height of everything inside the scroll area, measured each layout.
     @State private var scrollContentHeight: CGFloat = 0
+    /// Height of the parts that don't scroll (header, dividers, update row, footer).
+    @State private var fixedChromeHeight: CGFloat = 0
+    @ObservedObject private var panelLayout = CompanionPanelLayout.shared
 
-    /// The scroll area may use the screen's height minus room for the header,
-    /// the footer and the menu bar gap.
+    /// The scroll area gets what's left of the panel's height limit (set by
+    /// MenuBarPanelManager from the screen the menu bar icon is on) after the
+    /// parts that don't scroll.
     private var maximumScrollAreaHeight: CGFloat {
-        let visibleScreenHeight = NSScreen.main?.visibleFrame.height ?? 800
-        return max(240, visibleScreenHeight - 190)
+        max(160, panelLayout.maximumPanelHeight - fixedChromeHeight)
+    }
+
+    /// Before the first measurement, assume the content is as tall as allowed,
+    /// so the panel never opens squashed.
+    private var scrollAreaHeight: CGFloat {
+        let measuredOrAssumedHeight = scrollContentHeight > 0 ? scrollContentHeight : maximumScrollAreaHeight
+        return min(measuredOrAssumedHeight, maximumScrollAreaHeight)
     }
 
     @ViewBuilder
@@ -149,12 +159,23 @@ struct CompanionPanelView: View {
         }
     }
 
+    /// Reports a non-scrolling block's height (header and footer both use it;
+    /// the preference adds them up).
+    private var chromeHeightReader: some View {
+        GeometryReader { chromeGeometry in
+            Color.clear.preference(key: PanelFixedChromeHeightKey.self, value: chromeGeometry.size.height)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            panelHeader
-            Divider()
-                .background(DS.Colors.borderSubtle)
-                .padding(.horizontal, 16)
+            VStack(alignment: .leading, spacing: 0) {
+                panelHeader
+                Divider()
+                    .background(DS.Colors.borderSubtle)
+                    .padding(.horizontal, 16)
+            }
+            .background(chromeHeightReader)
 
             // Everything between the header and the footer scrolls, so the
             // panel never runs off the bottom of the screen.
@@ -167,7 +188,7 @@ struct CompanionPanelView: View {
                         }
                     )
             }
-            .frame(height: min(max(scrollContentHeight, 1), maximumScrollAreaHeight))
+            .frame(height: scrollAreaHeight)
             .onPreferenceChange(PanelScrollContentHeightKey.self) { measuredContentHeight in
                 guard abs(measuredContentHeight - scrollContentHeight) > 0.5 else { return }
                 scrollContentHeight = measuredContentHeight
@@ -175,20 +196,30 @@ struct CompanionPanelView: View {
                 NotificationCenter.default.post(name: .orchestraPanelContentHeightChanged, object: nil)
             }
 
-            Spacer()
-                .frame(height: 12)
+            VStack(alignment: .leading, spacing: 0) {
+                Spacer()
+                    .frame(height: 12)
 
-            Divider()
-                .background(DS.Colors.borderSubtle)
-                .padding(.horizontal, 16)
+                Divider()
+                    .background(DS.Colors.borderSubtle)
+                    .padding(.horizontal, 16)
 
-            updateSection
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
+                updateSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
 
-            footerSection
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                footerSection
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+            }
+            .background(chromeHeightReader)
+        }
+        // On the outer stack: the header and footer readers are siblings of
+        // the scroll view, so only a parent sees their summed preference.
+        .onPreferenceChange(PanelFixedChromeHeightKey.self) { measuredChromeHeight in
+            guard abs(measuredChromeHeight - fixedChromeHeight) > 0.5 else { return }
+            fixedChromeHeight = measuredChromeHeight
+            NotificationCenter.default.post(name: .orchestraPanelContentHeightChanged, object: nil)
         }
         .frame(width: 320)
         .background(panelBackground)
@@ -1704,4 +1735,20 @@ extension Notification.Name {
     /// Posted when the panel's content height changes, so MenuBarPanelManager
     /// can resize the panel (it sizes to its content, up to the screen height).
     static let orchestraPanelContentHeightChanged = Notification.Name("orchestraPanelContentHeightChanged")
+}
+
+/// Sum of the heights of the panel's non-scrolling parts.
+private struct PanelFixedChromeHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value += nextValue()
+    }
+}
+
+/// The panel's height limit, set by MenuBarPanelManager from the screen the
+/// menu bar icon is on (not NSScreen.main, which follows keyboard focus).
+@MainActor
+final class CompanionPanelLayout: ObservableObject {
+    static let shared = CompanionPanelLayout()
+    @Published var maximumPanelHeight: CGFloat = 700
 }

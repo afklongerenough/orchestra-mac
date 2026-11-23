@@ -186,6 +186,16 @@ final class MenuBarPanelManager: NSObject {
         panel?.makeKeyAndOrderFront(nil)
         panel?.orderFrontRegardless()
         installClickOutsideMonitor()
+
+        // SwiftUI measures the content during the first layout passes after
+        // showing; fit again once they've settled (a single re-fit can read a
+        // stale size, e.g. on a cold launch).
+        for settleDelaySeconds in [0.05, 0.25, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + settleDelaySeconds) { [weak self] in
+                guard let self, self.panel?.isVisible == true else { return }
+                self.positionPanelBelowStatusItem()
+            }
+        }
     }
 
     private func hidePanel() {
@@ -234,11 +244,17 @@ final class MenuBarPanelManager: NSObject {
 
         // Calculate the panel's content height from the hosting view's fitting size
         // so the panel snugly wraps the SwiftUI content instead of using a fixed height.
+        // The limit comes from the screen the menu bar icon is on; the panel's
+        // middle scrolls within it. Setting it lets SwiftUI size the scroll area
+        // before we read the fitting size.
+        let availableScreenHeight = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let maximumPanelHeight = availableScreenHeight - gapBelowMenuBar - 8
+        if abs(CompanionPanelLayout.shared.maximumPanelHeight - maximumPanelHeight) > 0.5 {
+            CompanionPanelLayout.shared.maximumPanelHeight = maximumPanelHeight
+            panel.contentView?.layoutSubtreeIfNeeded()
+        }
         let fittingSize = panel.contentView?.fittingSize ?? CGSize(width: panelWidth, height: panelHeight)
-        // Never taller than the screen below the menu bar (the middle of the
-        // panel scrolls instead).
-        let availableScreenHeight = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame.height ?? fittingSize.height
-        let actualPanelHeight = min(fittingSize.height, availableScreenHeight - gapBelowMenuBar - 4)
+        let actualPanelHeight = min(fittingSize.height, maximumPanelHeight)
 
         // Horizontally center the panel beneath the status item icon
         let panelOriginX = statusItemFrame.midX - (panelWidth / 2)
