@@ -31,6 +31,7 @@ struct CompanionPanelView: View {
     @ObservedObject private var connectorOAuthManager = ConnectorOAuthManager.shared
     @ObservedObject private var memoryStore = OrchestraMemoryStore.shared
     @ObservedObject private var noteTaker = OrchestraNoteTaker.shared
+    @State private var notesAudioSourceSelection = NotesAudioSource.current
     @State private var googleClientIDInput: String = ""
     @State private var googleClientSecretInput: String = ""
     @State private var googleAccountStatusText: String = ""
@@ -1200,6 +1201,25 @@ struct CompanionPanelView: View {
                     .foregroundColor(DS.Colors.textSecondary)
                     .pointerCursor()
                 }
+            }
+            HStack(spacing: 6) {
+                Text("Records:")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Menu(notesAudioSourceSelection.displayName) {
+                    ForEach(NotesAudioSource.allCases) { audioSource in
+                        Button(audioSource.displayName) {
+                            NotesAudioSource.current = audioSource
+                            notesAudioSourceSelection = audioSource
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .font(.system(size: 10, weight: .medium))
+                .disabled(noteTaker.isRecording)
+                .pointerCursor()
+                Spacer()
             }
             HStack(spacing: 6) {
                 Text("Saved to: \(noteTaker.destinationFolderURL?.lastPathComponent ?? "~/Orchestra/Notes")")

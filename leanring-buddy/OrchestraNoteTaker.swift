@@ -2,9 +2,11 @@
 //  OrchestraNoteTaker.swift
 //  leanring-buddy
 //
-//  "take notes on this": records the microphone (a lecture, a meeting),
-//  transcribes it live with Apple Speech, and when it stops, writes a
-//  structured summary with Gemini.
+//  "take notes on this": records a lecture or meeting, transcribes it live
+//  with Apple Speech, and when it stops, writes a structured summary with
+//  Gemini. What it records is picked in the menu (NotesAudioSource): the
+//  Mac's own audio plus the mic (default), the Mac's audio only (a YouTube
+//  lecture with headphones on), or the mic only (a lecture in the room).
 //
 //    ~/Orchestra/Notes/<date>-<slug>/audio.wav        the recording
 //    ~/Orchestra/Notes/<date>-<slug>/transcript.md    everything heard
@@ -56,6 +58,8 @@ final class OrchestraNoteTaker: ObservableObject {
 
     private var audioEngine: AVAudioEngine?
     private var audioSink: NoteAudioSink?
+    private var audioMixer: NotesAudioMixer?
+    private var macAudioCapture: NotesMacAudioCapture?
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var sessionFolderURL: URL?
@@ -89,8 +93,15 @@ final class OrchestraNoteTaker: ObservableObject {
     /// Starts recording. Returns a short status line (spoken by the caller).
     func startNotes(topicHint: String) async -> (succeeded: Bool, message: String) {
         guard !isRecording else { return (false, "already taking notes — say \"stop taking notes\" to finish") }
-        guard await ensureMicrophonePermission() else {
-            return (false, "the microphone permission is off for orchestra; turn it on in system settings, privacy and security")
+        let audioSource = NotesAudioSource.current
+        if audioSource.usesMicrophone {
+            guard await ensureMicrophonePermission() else {
+                return (false, "the microphone permission is off for orchestra; turn it on in system settings, privacy and security")
+            }
+        }
+        if audioSource.usesMacAudio && !CGPreflightScreenCaptureAccess() {
+            CGRequestScreenCaptureAccess()
+            return (false, "recording the mac's audio needs the screen recording permission for orchestra; turn it on in system settings, privacy and security, or switch notes to mic only in the menu")
         }
         guard await ensureSpeechRecognitionPermission() else {
             return (false, "speech recognition permission is off for orchestra; turn it on in system settings, privacy and security")
@@ -127,24 +138,64 @@ final class OrchestraNoteTaker: ObservableObject {
         audioSink = newAudioSink
         startRecognitionSegment(sink: newAudioSink)
 
-        let newAudioEngine = AVAudioEngine()
-        let inputNode = newAudioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            stopAudioAndRecognition()
-            return (false, "no microphone input found")
+        // Mic only keeps the original direct path; any mode with the Mac's
+        // audio goes through the mixer (16 kHz mono, mic + Mac summed).
+        let newAudioMixer: NotesAudioMixer? = audioSource.usesMacAudio
+            ? NotesAudioMixer(mixesMacAudioIntoMicrophone: audioSource == .macAudioAndMicrophone,
+                              deliverMixedBuffer: { [weak newAudioSink] mixedBuffer in newAudioSink?.append(mixedBuffer) })
+            : nil
+        audioMixer = newAudioMixer
+
+        if audioSource.usesMicrophone {
+            let newAudioEngine = AVAudioEngine()
+            let inputNode = newAudioEngine.inputNode
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                stopAudioAndRecognition()
+                return (false, "no microphone input found")
+            }
+            let audioMixerForMicrophoneTap = newAudioMixer
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak newAudioSink] buffer, _ in
+                if let audioMixerForMicrophoneTap {
+                    audioMixerForMicrophoneTap.appendMicrophoneBuffer(buffer)
+                } else {
+                    newAudioSink?.append(buffer)
+                }
+            }
+            do {
+                newAudioEngine.prepare()
+                try newAudioEngine.start()
+            } catch {
+                stopAudioAndRecognition()
+                return (false, "the microphone wouldn't start: \(error.localizedDescription)")
+            }
+            audioEngine = newAudioEngine
         }
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak newAudioSink] buffer, _ in
-            newAudioSink?.append(buffer)
+
+        var recordingWhatText = "the mic"
+        if audioSource.usesMacAudio, let newAudioMixer {
+            let newMacAudioCapture = NotesMacAudioCapture(onAudioBuffer: { [weak newAudioMixer] macAudioBuffer in
+                newAudioMixer?.appendMacAudioBuffer(macAudioBuffer)
+            })
+            newMacAudioCapture.onStoppedWithError = { captureError in
+                Task { @MainActor in
+                    OrchestraLog.write("📝 Notes: mac audio capture stopped: \(captureError.localizedDescription)")
+                }
+            }
+            do {
+                try await newMacAudioCapture.start()
+                macAudioCapture = newMacAudioCapture
+                recordingWhatText = audioSource == .macAudioOnly ? "the mac's audio" : "the mac's audio and the mic"
+            } catch {
+                OrchestraLog.write("📝 Notes: couldn't capture the mac's audio: \(error.localizedDescription)")
+                guard audioSource == .macAudioAndMicrophone else {
+                    stopAudioAndRecognition()
+                    return (false, "couldn't record the mac's audio (\(error.localizedDescription)); try again, or switch notes to mic only in the menu")
+                }
+                // Mixed mode still works from the mic alone.
+                recordingWhatText = "the mic only (the mac's audio couldn't be captured)"
+            }
         }
-        do {
-            newAudioEngine.prepare()
-            try newAudioEngine.start()
-        } catch {
-            stopAudioAndRecognition()
-            return (false, "the microphone wouldn't start: \(error.localizedDescription)")
-        }
-        audioEngine = newAudioEngine
 
         let headerText = "# Notes — \(Self.displayDateFormatter.string(from: startDate))\n\n"
             + (sessionTopicHint.isEmpty ? "" : "Topic: \(sessionTopicHint)\n\n")
@@ -156,7 +207,7 @@ final class OrchestraNoteTaker: ObservableObject {
         // Audible cue that the mic is now being recorded (the menu bar also
         // shows a red "● Recording" indicator for the whole session).
         NSSound(named: "Pop")?.play()
-        OrchestraLog.write("📝 Notes: recording started (\(folderName))")
+        OrchestraLog.write("📝 Notes: recording started (\(folderName), \(audioSource.rawValue))")
 
         autoStopTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.maximumRecordingSeconds * 1_000_000_000))
@@ -164,7 +215,7 @@ final class OrchestraNoteTaker: ObservableObject {
             OrchestraLog.write("📝 Notes: hit the 2-hour cap, stopping")
             _ = await self.stopNotes()
         }
-        return (true, "taking notes now — say \"stop taking notes\" when it's done")
+        return (true, "taking notes from \(recordingWhatText) now — say \"stop taking notes\" when it's done")
     }
 
     // MARK: - Stopping and writing
@@ -327,6 +378,11 @@ final class OrchestraNoteTaker: ObservableObject {
             audioEngine.stop()
         }
         audioEngine = nil
+        if let macAudioCapture {
+            Task { await macAudioCapture.stop() }
+        }
+        macAudioCapture = nil
+        audioMixer = nil
     }
 
     // MARK: - Permissions

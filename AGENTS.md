@@ -6,7 +6,7 @@
 >
 > **Long-term memory:** `OrchestraMemory.swift` keeps durable facts about the user in `~/Orchestra/memory.md`, read into every push-to-talk and Live prompt. The model adds facts with `[REMEMBER: …]` / `remember_fact` and removes them with `[FORGET: …]` / `forget_fact`; a safety filter blocks secrets and standing-order-shaped lines.
 >
-> **Lecture/meeting notes:** `OrchestraNoteTaker.swift` — "take notes on this" (`[NOTES: start]` / `take_notes`) records the mic, transcribes live with Apple Speech, and on stop writes audio.wav + transcript.md + a Gemini-written notes.md to `~/Orchestra/Notes/<session>/` and optionally a folder the user picks (e.g. an Obsidian vault). 2-hour cap; the wake word pauses while recording.
+> **Lecture/meeting notes:** `OrchestraNoteTaker.swift` — "take notes on this" (`[NOTES: start]` / `take_notes`) records the Mac's own audio + the mic by default (`NotesMacAudioCapture.swift`: ScreenCaptureKit audio, Orchestra's own voice excluded, mixed to 16 kHz mono; menu "Records:" also offers Mac audio only / Mic only), transcribes live with Apple Speech, and on stop writes audio.wav + transcript.md + a Gemini-written notes.md to `~/Orchestra/Notes/<session>/` and optionally a folder the user picks (e.g. an Obsidian vault). 2-hour cap; the wake word pauses while recording.
 >
 > **Reminders & Calendar:** `MacCalendarReminders.swift` (EventKit) — `[REMINDER: title | when]`, `[EVENT: title | start | end]`, `[SCHEDULE: day]` tags and `add_reminder` / `add_calendar_event` / `my_schedule` Live tools go straight into Apple Reminders/Calendar, no Hermes. Additive only (no deleting/changing existing items). Info.plist carries `NSRemindersFullAccessUsageDescription` / `NSCalendarsFullAccessUsageDescription`.
 >
@@ -85,6 +85,7 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `OrchestraMemory.swift` | ~143 | Long-term memory of the user (`~/Orchestra/memory.md`): remember/forget with dedupe and a secrets/standing-order safety filter; prompt section for both voice modes. |
 | `MacCalendarReminders.swift` | ~247 | EventKit bridge: add reminders (with alarm) and calendar events, read a day's schedule; forgiving date parsing for model output. |
 | `OrchestraNoteTaker.swift` | ~421 | Lecture/meeting recorder: AVAudioEngine + Apple Speech segments, WAV + transcript saving, Gemini summary to ~/Orchestra/Notes or a picked folder, 2-hour cap, finished announcement. |
+| `NotesMacAudioCapture.swift` | ~210 | Notes audio sources: `NotesAudioSource` setting, ScreenCaptureKit capture of the Mac's audio output, resampler and mic + Mac mixer. |
 | `SelectedTextActions.swift` | ~219 | Shift+control shortcut monitor, selection capture with clipboard restore, Gemini rewrite/explain/translate, paste-back (never presses return). |
 | `GeminiLiveSession.swift` | ~881 | Gemini Live two-way voice: websocket protocol, mic echo handling, screen frames, and the Live tool surface (jobs, connectors, reminders/calendar, notes, memory, takeover). |
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
