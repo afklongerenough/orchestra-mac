@@ -263,7 +263,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -546,6 +546,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
+        // A fresh engine each time: an engine that already ran can't switch its
+        // input device any more, and headphones may have come or gone since.
+        if !audioEngine.isRunning {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine = AVAudioEngine()
+        }
         // Bluetooth headphones: the Mac's built-in mic (keeps music playing).
         PreferredMicrophone.applyPreferredMicrophone(to: audioEngine, logLabel: "Push-to-talk")
         let inputNode = audioEngine.inputNode

@@ -661,7 +661,7 @@ final class GeminiLiveSession: NSObject {
         }
         // A Bluetooth headset's own mic: macOS's echo cancellation can hand back
         // pure silence from it, and with headphones there's no echo anyway.
-        if PreferredMicrophone.defaultInputIsBluetooth {
+        if PreferredMicrophone.isWearingBluetoothHeadset {
             try startAudio(useVoiceProcessing: false)
             isEchoCancellationActive = true
             OrchestraLog.write("🎙️ Live: microphone started (Bluetooth headset mic, no echo cancellation needed)")

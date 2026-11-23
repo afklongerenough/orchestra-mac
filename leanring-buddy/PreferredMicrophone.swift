@@ -37,11 +37,25 @@ enum PreferredMicrophone {
         return isBluetooth(deviceID: defaultInputDeviceID)
     }
 
+    /// True when sound is going to Bluetooth headphones (or a Bluetooth headset).
+    static var defaultOutputIsBluetooth: Bool {
+        guard let defaultOutputDeviceID = defaultDeviceID(selector: kAudioHardwarePropertyDefaultOutputDevice) else { return false }
+        return isBluetooth(deviceID: defaultOutputDeviceID)
+    }
+
+    /// Both the mic and the sound are Bluetooth, i.e. the user is wearing
+    /// headphones: no echo for the mic to pick up. (A Bluetooth mic with the
+    /// Mac's speakers is NOT this case: the speakers echo, so the normal
+    /// echo-cancelled setup is kept.)
+    static var isWearingBluetoothHeadset: Bool {
+        defaultInputIsBluetooth && defaultOutputIsBluetooth
+    }
+
     /// The built-in mic to use instead of a Bluetooth headset's mic, or nil to
-    /// keep the system default (setting off, no Bluetooth mic, or no built-in
-    /// mic, e.g. a Mac mini).
+    /// keep the system default (setting off, not wearing Bluetooth headphones,
+    /// or no built-in mic, e.g. a Mac mini).
     static func builtInMicrophoneReplacingBluetooth() -> AudioDeviceID? {
-        guard usesBuiltInMicWithBluetoothHeadphones, defaultInputIsBluetooth else { return nil }
+        guard usesBuiltInMicWithBluetoothHeadphones, isWearingBluetoothHeadset else { return nil }
         return builtInMicrophoneDeviceID()
     }
 
@@ -55,7 +69,11 @@ enum PreferredMicrophone {
             // built-in mic from earlier: follow the system default again.
             if let defaultInputDeviceID = defaultDeviceID(selector: kAudioHardwarePropertyDefaultInputDevice),
                audioEngine.inputNode.auAudioUnit.deviceID != defaultInputDeviceID {
-                try? audioEngine.inputNode.auAudioUnit.setDeviceID(defaultInputDeviceID)
+                do {
+                    try audioEngine.inputNode.auAudioUnit.setDeviceID(defaultInputDeviceID)
+                } catch {
+                    OrchestraLog.write("🎧 \(logLabel): couldn't switch back to the default mic (\(error.localizedDescription))")
+                }
             }
             return false
         }
