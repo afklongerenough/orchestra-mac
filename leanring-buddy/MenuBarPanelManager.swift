@@ -45,9 +45,12 @@ final class MenuBarPanelManager: NSObject {
         createStatusItem()
 
         noteRecordingCancellable = OrchestraNoteTaker.shared.$isRecording
+            .combineLatest(OrchestraNoteTaker.shared.$recordingSourceLabel)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording in
-                self?.updateRecordingIndicator(isRecording: isRecording)
+            .sink { [weak self] isRecording, recordingSourceLabel in
+                // Use the published values (the properties still hold the old
+                // ones while @Published is announcing a change).
+                self?.updateRecordingIndicator(isRecording: isRecording, recordingSourceLabel: recordingSourceLabel)
             }
 
         dismissPanelObserver = NotificationCenter.default.addObserver(
@@ -83,12 +86,12 @@ final class MenuBarPanelManager: NSObject {
 
     /// Red "● Recording" next to the menu bar icon while the note taker
     /// records, so the user can always see the mic is being captured.
-    private func updateRecordingIndicator(isRecording: Bool) {
+    private func updateRecordingIndicator(isRecording: Bool, recordingSourceLabel: String) {
         guard let button = statusItem?.button else { return }
         if isRecording {
             statusItem?.length = NSStatusItem.variableLength
             button.attributedTitle = NSAttributedString(
-                string: " ● Recording",
+                string: " ● Recording · \(recordingSourceLabel)",
                 attributes: [
                     .foregroundColor: NSColor.systemRed,
                     .font: NSFont.systemFont(ofSize: 11, weight: .semibold)

@@ -34,6 +34,8 @@ final class OrchestraNoteTaker: ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var statusText = "off"
     @Published private(set) var recordingStartDate: Date?
+    /// What's being recorded, for the menu bar indicator ("Mac + mic", "Mac audio", "Mic").
+    @Published private(set) var recordingSourceLabel = "Mic"
 
     /// Called with a short spoken line when the notes are written.
     /// CompanionManager wires this to the same announcement queue as jobs.
@@ -60,6 +62,8 @@ final class OrchestraNoteTaker: ObservableObject {
     private var audioSink: NoteAudioSink?
     private var audioMixer: NotesAudioMixer?
     private var macAudioCapture: NotesMacAudioCapture?
+    private var macAudioRestartAttemptCount = 0
+    private var macAudioHealthCheckTask: Task<Void, Never>?
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var sessionFolderURL: URL?
@@ -173,19 +177,13 @@ final class OrchestraNoteTaker: ObservableObject {
         }
 
         var recordingWhatText = "the mic"
+        recordingSourceLabel = "Mic"
+        macAudioRestartAttemptCount = 0
         if audioSource.usesMacAudio, let newAudioMixer {
-            let newMacAudioCapture = NotesMacAudioCapture(onAudioBuffer: { [weak newAudioMixer] macAudioBuffer in
-                newAudioMixer?.appendMacAudioBuffer(macAudioBuffer)
-            })
-            newMacAudioCapture.onStoppedWithError = { captureError in
-                Task { @MainActor in
-                    OrchestraLog.write("📝 Notes: mac audio capture stopped: \(captureError.localizedDescription)")
-                }
-            }
             do {
-                try await newMacAudioCapture.start()
-                macAudioCapture = newMacAudioCapture
+                try await startMacAudioCapture(into: newAudioMixer)
                 recordingWhatText = audioSource == .macAudioOnly ? "the mac's audio" : "the mac's audio and the mic"
+                recordingSourceLabel = audioSource == .macAudioOnly ? "Mac audio" : "Mac + mic"
             } catch {
                 OrchestraLog.write("📝 Notes: couldn't capture the mac's audio: \(error.localizedDescription)")
                 guard audioSource == .macAudioAndMicrophone else {
@@ -203,6 +201,17 @@ final class OrchestraNoteTaker: ObservableObject {
 
         isRecording = true
         recordingStartDate = startDate
+        if macAudioCapture != nil, let newAudioMixer {
+            // Nothing from the Mac after 10 s means nothing is playing, or the
+            // capture/conversion isn't working: worth a line in the log.
+            macAudioHealthCheckTask = Task { [weak self, weak newAudioMixer] in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !Task.isCancelled, let self, self.isRecording, let newAudioMixer else { return }
+                if newAudioMixer.receivedMacAudioFrameCount == 0 {
+                    OrchestraLog.write("📝 Notes: no mac audio after 10 s (nothing playing, or the capture isn't delivering)")
+                }
+            }
+        }
         statusText = "recording"
         // Audible cue that the mic is now being recorded (the menu bar also
         // shows a red "● Recording" indicator for the whole session).
@@ -218,6 +227,50 @@ final class OrchestraNoteTaker: ObservableObject {
         return (true, "taking notes from \(recordingWhatText) now — say \"stop taking notes\" when it's done")
     }
 
+    // MARK: - Mac audio
+
+    private func startMacAudioCapture(into audioMixer: NotesAudioMixer) async throws {
+        let newMacAudioCapture = NotesMacAudioCapture(onAudioBuffer: { [weak audioMixer] macAudioBuffer in
+            audioMixer?.appendMacAudioBuffer(macAudioBuffer)
+        })
+        newMacAudioCapture.onStoppedWithError = { [weak self] captureError in
+            Task { @MainActor [weak self] in
+                OrchestraLog.write("📝 Notes: mac audio capture stopped: \(captureError.localizedDescription)")
+                await self?.restartMacAudioCaptureAfterStop()
+            }
+        }
+        try await newMacAudioCapture.start()
+        macAudioCapture = newMacAudioCapture
+    }
+
+    /// macOS can stop the capture mid-lecture (screen lock, display sleep,
+    /// resolution change). Try to pick it back up; if that keeps failing, say
+    /// so out loud instead of quietly recording nothing.
+    private func restartMacAudioCaptureAfterStop() async {
+        guard isRecording, !isStopping, let audioMixer else { return }
+        macAudioCapture = nil
+        while isRecording && !isStopping && macAudioRestartAttemptCount < 5 {
+            macAudioRestartAttemptCount += 1
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard isRecording, !isStopping else { return }
+            do {
+                try await startMacAudioCapture(into: audioMixer)
+                OrchestraLog.write("📝 Notes: mac audio capture restarted")
+                return
+            } catch {
+                OrchestraLog.write("📝 Notes: mac audio restart \(macAudioRestartAttemptCount) failed: \(error.localizedDescription)")
+            }
+        }
+        guard isRecording, !isStopping else { return }
+        if recordingSourceLabel == "Mac audio" {
+            recordingSourceLabel = "Mac audio lost"
+            onNotesFinishedAnnouncement?("heads up, i lost the mac's audio for your notes. say stop taking notes and start again, or switch notes to mic only.")
+        } else {
+            recordingSourceLabel = "Mic"
+            onNotesFinishedAnnouncement?("heads up, i lost the mac's audio, so your notes are only recording the mic now.")
+        }
+    }
+
     // MARK: - Stopping and writing
 
     /// Stops recording, saves audio + transcript, and writes the summary.
@@ -230,6 +283,16 @@ final class OrchestraNoteTaker: ObservableObject {
         NSSound(named: "Glass")?.play()
         autoStopTask?.cancel()
         autoStopTask = nil
+
+        macAudioHealthCheckTask?.cancel()
+        macAudioHealthCheckTask = nil
+        // Stop the Mac-audio capture and wait for it, then send out what the
+        // mixer still holds, so the end of the recording isn't dropped.
+        if let macAudioCapture {
+            self.macAudioCapture = nil
+            await macAudioCapture.stop()
+        }
+        audioMixer?.flushPendingMacAudio()
 
         // Let Apple Speech finish the last segment before tearing down.
         audioSink?.endAudio()
@@ -383,6 +446,8 @@ final class OrchestraNoteTaker: ObservableObject {
         }
         macAudioCapture = nil
         audioMixer = nil
+        macAudioHealthCheckTask?.cancel()
+        macAudioHealthCheckTask = nil
     }
 
     // MARK: - Permissions

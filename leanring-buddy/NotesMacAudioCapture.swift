@@ -56,7 +56,11 @@ final class NotesMonoResampler {
         self.targetAudioFormat = targetAudioFormat
     }
 
-    func convert(_ inputBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    func convert(_ originalInputBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        // Average the channels ourselves first: AVAudioConverter's downmix only
+        // kicks in when both formats carry a channel layout, and the Mac-audio
+        // format from ScreenCaptureKit usually doesn't.
+        let inputBuffer = Self.averagedToMono(originalInputBuffer) ?? originalInputBuffer
         let inputFormatDescription = inputBuffer.format.settings.description
         if currentInputFormatDescription != inputFormatDescription {
             audioConverter = AVAudioConverter(from: inputBuffer.format, to: targetAudioFormat)
@@ -84,6 +88,37 @@ final class NotesMonoResampler {
         guard conversionStatus != .error, outputBuffer.frameLength > 0 else { return nil }
         return outputBuffer
     }
+
+    /// Float32 multi-channel → Float32 mono at the same sample rate, or nil if
+    /// the buffer is already mono or in a layout this doesn't handle.
+    private static func averagedToMono(_ inputBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        let inputFormat = inputBuffer.format
+        let channelCount = Int(inputFormat.channelCount)
+        guard channelCount > 1, inputFormat.commonFormat == .pcmFormatFloat32,
+              let monoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: inputFormat.sampleRate, channels: 1, interleaved: false),
+              let monoBuffer = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: inputBuffer.frameLength),
+              let monoSamples = monoBuffer.floatChannelData?[0],
+              let inputChannelSamples = inputBuffer.floatChannelData else { return nil }
+        let frameCount = Int(inputBuffer.frameLength)
+        let channelWeight = 1 / Float(channelCount)
+        if inputFormat.isInterleaved {
+            // One channel pointer holding L R L R …
+            let interleavedSamples = inputChannelSamples[0]
+            for frameIndex in 0..<frameCount {
+                var summedSample: Float = 0
+                for channelIndex in 0..<channelCount { summedSample += interleavedSamples[frameIndex * channelCount + channelIndex] }
+                monoSamples[frameIndex] = summedSample * channelWeight
+            }
+        } else {
+            for frameIndex in 0..<frameCount {
+                var summedSample: Float = 0
+                for channelIndex in 0..<channelCount { summedSample += inputChannelSamples[channelIndex][frameIndex] }
+                monoSamples[frameIndex] = summedSample * channelWeight
+            }
+        }
+        monoBuffer.frameLength = inputBuffer.frameLength
+        return monoBuffer
+    }
 }
 
 /// Puts the microphone and the Mac's audio together into one 16 kHz mono
@@ -95,11 +130,20 @@ final class NotesMonoResampler {
 final class NotesAudioMixer: @unchecked Sendable {
     static let mixedAudioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
     private static let maximumPendingMacAudioSamples = 16_000 * 2
+    /// Both sides of a loud call summed at full volume would clip and distort.
+    private static let mixedSourceGain: Float = 0.7
 
     private let lock = NSLock()
     private let microphoneResampler = NotesMonoResampler(targetAudioFormat: NotesAudioMixer.mixedAudioFormat)
     private let macAudioResampler = NotesMonoResampler(targetAudioFormat: NotesAudioMixer.mixedAudioFormat)
     private var pendingMacAudioSamples: [Float] = []
+    /// How many Mac-audio frames made it through, so the note taker can tell
+    /// "nothing playing / conversion failing" apart from a working capture.
+    private var receivedMacAudioFrameTotal = 0
+    var receivedMacAudioFrameCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return receivedMacAudioFrameTotal
+    }
     private let mixesMacAudioIntoMicrophone: Bool
     private let deliverMixedBuffer: @Sendable (AVAudioPCMBuffer) -> Void
 
@@ -117,7 +161,7 @@ final class NotesAudioMixer: @unchecked Sendable {
             lock.lock()
             let mixedSampleCount = min(Int(resampledMicrophoneBuffer.frameLength), pendingMacAudioSamples.count)
             for sampleIndex in 0..<mixedSampleCount {
-                let summedSample = microphoneSamples[sampleIndex] + pendingMacAudioSamples[sampleIndex]
+                let summedSample = (microphoneSamples[sampleIndex] + pendingMacAudioSamples[sampleIndex]) * Self.mixedSourceGain
                 microphoneSamples[sampleIndex] = max(-1, min(1, summedSample))
             }
             pendingMacAudioSamples.removeFirst(mixedSampleCount)
@@ -129,6 +173,9 @@ final class NotesAudioMixer: @unchecked Sendable {
     /// Called on the ScreenCaptureKit audio queue.
     func appendMacAudioBuffer(_ macAudioBuffer: AVAudioPCMBuffer) {
         guard let resampledMacAudioBuffer = macAudioResampler.convert(macAudioBuffer) else { return }
+        lock.lock()
+        receivedMacAudioFrameTotal += Int(resampledMacAudioBuffer.frameLength)
+        lock.unlock()
         guard mixesMacAudioIntoMicrophone else {
             deliverMixedBuffer(resampledMacAudioBuffer)
             return
@@ -140,6 +187,21 @@ final class NotesAudioMixer: @unchecked Sendable {
             pendingMacAudioSamples.removeFirst(pendingMacAudioSamples.count - Self.maximumPendingMacAudioSamples)
         }
         lock.unlock()
+    }
+
+    /// On stop: Mac audio still waiting for a mic buffer goes out on its own,
+    /// so the last moments of a lecture aren't lost.
+    func flushPendingMacAudio() {
+        lock.lock()
+        let leftoverSamples = pendingMacAudioSamples
+        pendingMacAudioSamples.removeAll()
+        lock.unlock()
+        guard !leftoverSamples.isEmpty,
+              let leftoverBuffer = AVAudioPCMBuffer(pcmFormat: Self.mixedAudioFormat, frameCapacity: AVAudioFrameCount(leftoverSamples.count)),
+              let leftoverChannel = leftoverBuffer.floatChannelData?[0] else { return }
+        for sampleIndex in 0..<leftoverSamples.count { leftoverChannel[sampleIndex] = leftoverSamples[sampleIndex] * Self.mixedSourceGain }
+        leftoverBuffer.frameLength = AVAudioFrameCount(leftoverSamples.count)
+        deliverMixedBuffer(leftoverBuffer)
     }
 }
 
